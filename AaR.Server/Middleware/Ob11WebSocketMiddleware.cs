@@ -53,6 +53,10 @@ public class Ob11WebSocketMiddleware
         }
 
         using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
+        // register before the first send so the lifecycle frame and every later
+        // frame share the server-side per-connection send lock
+        var clientId = Guid.NewGuid().ToString("N");
+        _ob11.RegisterWsClient(clientId, ws);
         // P1-1: late-connecting clients must receive lifecycle connect immediately
         try
         {
@@ -66,11 +70,9 @@ public class Ob11WebSocketMiddleware
             };
             var connectJson = Ob11Json.Serialize(connectEvt);
             var connectBytes = Encoding.UTF8.GetBytes(connectJson);
-            await ws.SendAsync(new ArraySegment<byte>(connectBytes), WebSocketMessageType.Text, true, ctx.RequestAborted);
+            await _ob11.SendWsFrameAsync(clientId, ws, connectBytes);
         }
         catch { }
-        var clientId = Guid.NewGuid().ToString("N");
-        _ob11.RegisterWsClient(clientId, ws);
         _logger.LogInformation("ob11 ws client connected: {Id}", clientId);
 
         var buffer = new byte[1024 * 256];
@@ -93,7 +95,7 @@ public class Ob11WebSocketMiddleware
 
                 if (result.MessageType == WebSocketMessageType.Close) break;
                 var text = Encoding.UTF8.GetString(ms.ToArray());
-                _ = HandleClientFrameAsync(ws, text);
+                _ = HandleClientFrameAsync(clientId, ws, text);
             }
         }
         catch (OperationCanceledException) { }
@@ -105,7 +107,7 @@ public class Ob11WebSocketMiddleware
         }
     }
 
-    private async Task HandleClientFrameAsync(WebSocket ws, string text)
+    private async Task HandleClientFrameAsync(string clientId, WebSocket ws, string text)
     {
         string? echo = null;
         try
@@ -120,20 +122,21 @@ public class Ob11WebSocketMiddleware
                     p[prop.Name] = prop.Value.Clone();
 
             var response = await _ob11.HandleActionAsync(action, p, echo);
-            await SendAsync(ws, response);
+            await SendAsync(clientId, ws, response);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "ob11 ws frame failed");
-            await SendAsync(ws, Ob11Response.Fail(-1, ex.Message, echo: echo));
+            await SendAsync(clientId, ws, Ob11Response.Fail(-1, ex.Message, echo: echo));
         }
     }
 
-    private static async Task SendAsync(WebSocket ws, Ob11Response response)
+    private async Task SendAsync(string clientId, WebSocket ws, Ob11Response response)
     {
         if (ws.State != WebSocketState.Open) return;
         var json = Ob11Json.Serialize(response);
         var bytes = Encoding.UTF8.GetBytes(json);
-        await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+        // shared per-connection lock: responses race with event broadcasts
+        await _ob11.SendWsFrameAsync(clientId, ws, bytes);
     }
 }

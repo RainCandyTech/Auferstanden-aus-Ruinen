@@ -23,16 +23,34 @@ public class Ob11Server
 
     // msgId -> "chatType|peerUid|seq" for delete_msg / get_msg / reply building
     private readonly ConcurrentDictionary<string, string> _msgIndex = new();
+    // FIFO eviction queues for the bounded in-memory indexes: unlike the previous
+    // arbitrary Keys.Take(N) trimming this drops the *oldest inserted* entries,
+    // so freshly seen message ids always survive
+    private readonly ConcurrentQueue<string> _msgIndexOrder = new();
     // "chatType|peerUid|seq" -> msgId, to resolve reply quotes (replayMsgSeq)
     private readonly ConcurrentDictionary<string, string> _seqIndex = new();
+    private readonly ConcurrentQueue<string> _seqIndexOrder = new();
     // media key (md5/uuid) -> media reference for get_image / get_record / get_file
     private readonly ConcurrentDictionary<string, Ob11Mapper.MediaRef> _mediaIndex = new();
-    // recall event dedup: msgId -> emitted tick
+    private readonly ConcurrentQueue<string> _mediaIndexOrder = new();
+    // recall event dedup: msgId -> emitted tick (shared by both recall paths)
     private readonly ConcurrentDictionary<string, long> _recallEmitted = new();
+    // last recall emission per peer ("chatType|peerUid" -> tick): the listUpdate and
+    // grayTip paths describe the *same* recall event milliseconds apart — this keeps
+    // them from double-emitting without swallowing distinct recalls (>3s apart)
+    private readonly ConcurrentDictionary<string, long> _recentRecallPeer = new();
+    // peer -> (operatorUin, tick) learned from grayTip revoke tips; the listUpdate
+    // path has the real message_id but no operator info, so it borrows this
+    private readonly ConcurrentDictionary<string, (string OperatorUin, long Tick)> _recallOperator = new();
     // sent-message marker -> real msgId (delivered via onMsgInfoListUpdate)
     private readonly ConcurrentDictionary<string, string> _markerToRealId = new();
+    private readonly ConcurrentQueue<string> _markerOrder = new();
     private readonly CancellationTokenSource _shutdownCts = new();
-    private readonly ConcurrentDictionary<string, long> _recentEventKeys = new();
+    // uid -> uin cache, learned from every incoming record and kernel list calls
+    private readonly ConcurrentDictionary<string, string> _uidToUin = new();
+    // per-connection send locks: concurrent WebSocket.SendAsync on one socket
+    // throws InvalidOperationException (.NET forbids parallel sends)
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _wsSendLocks = new();
 
     /// <summary>Force OneBot id-ish fields to strings (JS frameworks overflow >2^53 ints).</summary>
     private static void NormalizeIdFields(Dictionary<string, object?> evt)
@@ -60,13 +78,46 @@ public class Ob11Server
         _hub = hub;
         _bridge.BridgeChanged += () =>
         {
-            if (_bridge.IsBridgeConnected) _ = RefreshSelfLoopAsync();
+            if (_bridge.IsBridgeConnected)
+                _ = Task.Run(async () =>
+                {
+                    await RefreshSelfLoopAsync();
+                    // prime the uid->uin cache right away so events arriving before
+                    // any get_friend_list / get_group_list call still resolve uins
+                    await PrimeUinLookupAsync();
+                });
         };
         _ = Task.Run(() => HeartbeatLoopAsync(_shutdownCts.Token));
     }
 
-    public void RegisterWsClient(string id, System.Net.WebSockets.WebSocket ws) => _wsClients[id] = ws;
-    public void RemoveWsClient(string id) => _wsClients.TryRemove(id, out _);
+    public void RegisterWsClient(string id, System.Net.WebSockets.WebSocket ws)
+    {
+        _wsClients[id] = ws;
+        _wsSendLocks.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
+    }
+
+    public void RemoveWsClient(string id)
+    {
+        _wsClients.TryRemove(id, out _);
+        if (_wsSendLocks.TryRemove(id, out var l)) l.Dispose();
+    }
+
+    /// <summary>Serialize a text frame onto a registered forward-WS client.</summary>
+    public async Task SendWsFrameAsync(string clientId, System.Net.WebSockets.WebSocket ws, byte[] bytes)
+    {
+        var l = _wsSendLocks.GetOrAdd(clientId, _ => new SemaphoreSlim(1, 1));
+        await l.WaitAsync();
+        try
+        {
+            if (ws.State != System.Net.WebSockets.WebSocketState.Open) return;
+            await ws.SendAsync(new ArraySegment<byte>(bytes),
+                System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+        }
+        finally { l.Release(); }
+    }
+
+    /// <summary>Cancel background loops on host shutdown (called from Program.cs).</summary>
+    public void Shutdown() => _shutdownCts.Cancel();
     public int WsClientCount => _wsClients.Count;
 
     private async Task RefreshSelfLoopAsync()
@@ -132,6 +183,9 @@ public class Ob11Server
     public volatile int EventsReceived;
     public volatile int EventsBroadcast;
 
+    // shared HttpClient for download_file (a per-call new HttpClient() leaks sockets)
+    private static readonly HttpClient DownloadHttp = new() { Timeout = TimeSpan.FromSeconds(120) };
+
     public async Task OnInternalEventAsync(string name, string payloadJson)
     {
         EventsReceived++;
@@ -179,18 +233,18 @@ public class Ob11Server
             var msgId = Ob11.Str(rec, "msgId") ?? "";
             var peerUid = Ob11.Str(rec, "peerUid") ?? "";
             var seq = Ob11.Str(rec, "msgSeq") ?? "0";
-            _msgIndex[msgId] = $"{chatType}|{peerUid}|{seq}";
+            RememberMsgId(msgId, $"{chatType}|{peerUid}|{seq}");
             RememberSeq(chatType.ToString(), peerUid, seq, msgId);
-            TrimIndex();
 
             var isGroup = chatType == 2;
             var senderUid = Ob11.Str(rec, "senderUid") ?? "";
             var senderUin = Ob11.Str(rec, "senderUin") ?? "";
-            if (string.IsNullOrEmpty(senderUin)) senderUin = LookupUin(senderUid);
+            LearnUin(senderUid, senderUin);
+            if (string.IsNullOrEmpty(senderUin)) senderUin = await ResolveUinCachedAsync(senderUid);
 
-            var segments = Ob11Mapper.ElementsToSegments(
+            var segments = await Ob11Mapper.ElementsToSegmentsAsync(
                 rec.TryGetProperty("elements", out var els) ? els : default,
-                uid => LookupUin(uid));
+                ResolveUinForMapperAsync);
             if (segments.Count == 0) continue;
 
             IndexMedia(rec, msgId, chatType, peerUid);
@@ -266,10 +320,9 @@ public class Ob11Server
     private void RememberSeq(string chatType, string peerUid, string seq, string msgId)
     {
         if (seq.Length == 0 || seq == "0" || msgId.Length == 0) return;
-        _seqIndex[$"{chatType}|{peerUid}|{seq}"] = msgId;
-        if (_seqIndex.Count > 5000)
-            foreach (var k in _seqIndex.Keys.Take(300))
-                _seqIndex.TryRemove(k, out _);
+        var key = $"{chatType}|{peerUid}|{seq}";
+        if (_seqIndex.TryAdd(key, msgId)) _seqIndexOrder.Enqueue(key);
+        TrimSeqIndex();
     }
 
     private void IndexMedia(JsonElement rec, string msgId, long chatType, string peerUid)
@@ -278,6 +331,7 @@ public class Ob11Server
         foreach (var m in Ob11Mapper.CollectMedia(els, msgId, (int)chatType, peerUid))
         {
             _mediaIndex[m.Key] = m;
+            _mediaIndexOrder.Enqueue(m.Key); // duplicates OK: trim dedups via TryRemove
             TrimMediaIndex();
         }
     }
@@ -285,8 +339,17 @@ public class Ob11Server
     private void TrimMediaIndex()
     {
         if (_mediaIndex.Count <= 3000) return;
-        foreach (var k in _mediaIndex.Keys.Take(300))
+        // FIFO: drop the oldest inserted media references first
+        while (_mediaIndex.Count > 3000 && _mediaIndexOrder.TryDequeue(out var k))
             _mediaIndex.TryRemove(k, out _);
+    }
+
+    private void RememberMsgId(string msgId, string idx)
+    {
+        if (msgId.Length == 0) return;
+        _msgIndex[msgId] = idx;
+        _msgIndexOrder.Enqueue(msgId);
+        TrimIndex();
     }
 
     private async Task HandleMsgListUpdateAsync(JsonElement root)
@@ -306,9 +369,29 @@ public class Ob11Server
             {
                 var recallMsgId = Ob11.Str(rec, "msgId") ?? "";
                 var nowTick = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                var peerKey = $"{chatType}|{Ob11.Str(rec, "peerUid") ?? ""}";
                 if (_recallEmitted.TryGetValue(recallMsgId, out var lastTick) && nowTick - lastTick < 30000) continue;
+                // the grayTip path emits for the same recall event milliseconds apart
+                if (_recentRecallPeer.TryGetValue(peerKey, out var peerTick) && nowTick - peerTick < 3000) continue;
                 _recallEmitted[recallMsgId] = nowTick;
+                _recentRecallPeer[peerKey] = nowTick;
+                TrimRecallDedup();
                 var isGroup = chatType == 2;
+                var senderUid = Ob11.Str(rec, "senderUid") ?? "";
+                var senderUin = Ob11.Str(rec, "senderUin") ?? "";
+                LearnUin(senderUid, senderUin);
+                if (string.IsNullOrEmpty(senderUin)) senderUin = await ResolveUinCachedAsync(senderUid);
+                // operator: prefer the grayTip-learned operator for this peer; when the
+                // sender revoked their own message the operator is the sender; otherwise
+                // (unknown admin revoke) fall back to self
+                string operatorUin;
+                if (_recallOperator.TryGetValue(peerKey, out var op) && nowTick - op.Tick < 15000 &&
+                    !string.IsNullOrEmpty(op.OperatorUin))
+                    operatorUin = op.OperatorUin;
+                else if (!string.IsNullOrEmpty(senderUid) && senderUid == SelfUid)
+                    operatorUin = senderUin;
+                else
+                    operatorUin = SelfUin;
                 await BroadcastAsync(new Dictionary<string, object?>
                 {
                     ["time"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
@@ -316,8 +399,8 @@ public class Ob11Server
                     ["post_type"] = "notice",
                     ["notice_type"] = isGroup ? "group_recall" : "friend_recall",
                     ["group_id"] = isGroup ? (Ob11.Str(rec, "peerUid") ?? "") : null,
-                    ["user_id"] = Ob11.Str(rec, "senderUin") ?? LookupUin(Ob11.Str(rec, "senderUid") ?? ""),
-                    ["operator_id"] = isGroup ? SelfUin : Ob11.Str(rec, "senderUin") ?? SelfUin,
+                    ["user_id"] = senderUin,
+                    ["operator_id"] = operatorUin,
                     ["message_id"] = Ob11.Str(rec, "msgId") ?? "",
                 });
                 continue;
@@ -333,12 +416,16 @@ public class Ob11Server
                 var msgId = Ob11.Str(rec, "msgId") ?? "";
                 var peerUid = Ob11.Str(rec, "peerUid") ?? "";
                 var seq = Ob11.Str(rec, "msgSeq") ?? "0";
-                _msgIndex[msgId] = $"{chatType}|{peerUid}|{seq}";
+                RememberMsgId(msgId, $"{chatType}|{peerUid}|{seq}");
                 RememberSeq(chatType.ToString(), peerUid, seq, msgId);
                 // guildId on self-sent records is our generated send marker -> map to real id
                 var marker = Ob11.Str(rec, "guildId") ?? "";
                 if (!string.IsNullOrEmpty(marker) && marker.StartsWith("7") && marker != msgId)
+                {
                     _markerToRealId[marker] = msgId;
+                    _markerOrder.Enqueue(marker);
+                    TrimMarkerIndex();
+                }
 
                 var isGroup = chatType == 2;
                 var senderUid = Ob11.Str(rec, "senderUid") ?? "";
@@ -346,9 +433,9 @@ public class Ob11Server
                 if (string.IsNullOrEmpty(senderUin)) senderUin = LookupUin(senderUid);
                 if (string.IsNullOrEmpty(senderUin)) senderUin = SelfUin;
 
-                var segments = Ob11Mapper.ElementsToSegments(
+                var segments = await Ob11Mapper.ElementsToSegmentsAsync(
                     rec.TryGetProperty("elements", out var els) ? els : default,
-                    uid => LookupUin(uid));
+                    ResolveUinForMapperAsync);
                 if (segments.Count == 0) continue;
 
                 IndexMedia(rec, msgId, chatType, peerUid);
@@ -393,6 +480,32 @@ public class Ob11Server
                 if (subI == 1) // revoke
                 {
                     var isGroup = Ob11.Long(rec, "chatType") == 2;
+                    var peerKey = $"{Ob11.Long(rec, "chatType")}|{Ob11.Str(rec, "peerUid") ?? ""}";
+                    var nowTick = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    // NT revoke gray tips carry the operator identity — cache it so the
+                    // onMsgInfoListUpdate path (real message_id, no operator info) can
+                    // emit the correct operator_id for the same recall event
+                    var revokeOperatorUin = "";
+                    if (gt.TryGetProperty("revokeElement", out var rv) && rv.ValueKind == JsonValueKind.Object)
+                    {
+                        var operatorUid = Ob11.Str(rv, "operatorUid") ?? "";
+                        if (!string.IsNullOrEmpty(operatorUid))
+                            revokeOperatorUin = LookupUin(operatorUid);
+                        // learn the original sender too when present
+                        LearnUin(Ob11.Str(rv, "operatorUid"), revokeOperatorUin);
+                    }
+                    _recallOperator[peerKey] = (revokeOperatorUin, nowTick);
+                    var tipMsgId = Ob11.Str(rec, "msgId") ?? "";
+                    if (_recallEmitted.TryGetValue(tipMsgId, out var tipTick) && nowTick - tipTick < 30000) continue;
+                    if (_recentRecallPeer.TryGetValue(peerKey, out var peerTick) && nowTick - peerTick < 3000) continue;
+                    _recallEmitted[tipMsgId] = nowTick;
+                    _recentRecallPeer[peerKey] = nowTick;
+                    TrimRecallDedup();
+                    var senderUin = Ob11.Str(rec, "senderUin") ?? "";
+                    if (string.IsNullOrEmpty(senderUin)) senderUin = await ResolveUinCachedAsync(Ob11.Str(rec, "senderUid") ?? "");
+                    var operatorUin = !string.IsNullOrEmpty(revokeOperatorUin)
+                        ? revokeOperatorUin
+                        : (!string.IsNullOrEmpty(senderUin) ? senderUin : SelfUin);
                     await BroadcastAsync(new Dictionary<string, object?>
                     {
                         ["time"] = Ob11.Long(rec, "msgTime"),
@@ -400,9 +513,9 @@ public class Ob11Server
                         ["post_type"] = "notice",
                         ["notice_type"] = isGroup ? "group_recall" : "friend_recall",
                         ["group_id"] = isGroup ? (Ob11.Str(rec, "peerUid") ?? "") : null,
-                        ["user_id"] = Ob11.Str(rec, "senderUin") ?? "",
-                        ["operator_id"] = SelfUin,
-                        ["message_id"] = Ob11.Str(rec, "msgId") ?? "",
+                        ["user_id"] = senderUin,
+                        ["operator_id"] = operatorUin,
+                        ["message_id"] = tipMsgId,
                     });
                 }
                 else if (subI == 4 && gt.TryGetProperty("groupElement", out var ge))
@@ -550,20 +663,21 @@ public class Ob11Server
         return ToElement(new Dictionary<string, object?> { ["res_id"] = outRes, ["message_id"] = outMsgId });
     }
 
-    private JsonElement BuildHistoryResponse(JsonElement r, string peerId)
+    private async Task<JsonElement> BuildHistoryResponse(JsonElement r, string peerId)
     {
         var items = new List<object?>();
         if (r.TryGetProperty("msgList", out var ml) && ml.ValueKind == JsonValueKind.Array)
         {
             foreach (var rec in ml.EnumerateArray())
             {
-                var segs = Ob11Mapper.ElementsToSegments(
+                var segs = await Ob11Mapper.ElementsToSegmentsAsync(
                     rec.TryGetProperty("elements", out var els) ? els : default,
-                    uid => LookupUin(uid));
+                    ResolveUinForMapperAsync);
                 var mid = Ob11.Str(rec, "msgId") ?? "";
-                var senderUin = Ob11.Str(rec, "senderUin") ?? LookupUin(Ob11.Str(rec, "senderUid") ?? "");
+                var senderUin = Ob11.Str(rec, "senderUin") ?? await ResolveUinCachedAsync(Ob11.Str(rec, "senderUid") ?? "");
+                LearnUin(Ob11.Str(rec, "senderUid"), senderUin);
                 var chatType = Ob11.Long(rec, "chatType");
-                _msgIndex[mid] = $"{chatType}|{Ob11.Str(rec, "peerUid") ?? peerId}|{Ob11.Str(rec, "msgSeq") ?? "0"}";
+                RememberMsgId(mid, $"{chatType}|{Ob11.Str(rec, "peerUid") ?? peerId}|{Ob11.Str(rec, "msgSeq") ?? "0"}");
                 RememberSeq(chatType.ToString(), Ob11.Str(rec, "peerUid") ?? peerId, Ob11.Str(rec, "msgSeq") ?? "0", mid);
                 IndexMedia(rec, mid, chatType, Ob11.Str(rec, "peerUid") ?? peerId);
                 IndexReplyTargets(segs, chatType, Ob11.Str(rec, "peerUid") ?? peerId);
@@ -588,20 +702,83 @@ public class Ob11Server
     private string LookupUin(string uid)
     {
         if (string.IsNullOrEmpty(uid)) return "";
-        if (uid.StartsWith('u')) return _lookupUin(uid) ?? "";
+        if (uid.StartsWith('u'))
+        {
+            // server-side cache first (learned from records / member lists / priming),
+            // then the prime-time snapshot func, so chat participants resolve even
+            // before any friend/group list was fetched
+            if (_uidToUin.TryGetValue(uid, out var v) && !string.IsNullOrEmpty(v)) return v;
+            if (_primedUinLookup is not null && _primedUinLookup(uid) is { } primed && primed.Length > 0)
+            {
+                _uidToUin[uid] = primed;
+                return primed;
+            }
+            return "";
+        }
         return uid; // already numeric
     }
 
-    private Func<string, string?> _lookupUin = _ => null;
+    private Func<string, string?>? _primedUinLookup;
 
-    /// <summary>Set by actions that pre-load uid->uin maps (buddy/group fetch).</summary>
-    public void SetUinLookup(Func<string, string?> lookup) => _lookupUin = lookup;
+    /// <summary>uid -> uin for the OB11 mapper: cache first, then a bounded kernel RPC.
+    /// Failures return null (empty qq field) instead of aborting the whole mapping.</summary>
+    private async Task<string?> ResolveUinForMapperAsync(string uid)
+    {
+        if (string.IsNullOrEmpty(uid)) return "";
+        if (!uid.StartsWith('u')) return uid;
+        if (_uidToUin.TryGetValue(uid, out var v) && !string.IsNullOrEmpty(v)) return v;
+        string uin;
+        try { uin = await ResolveUinAsync(uid); } // kernel uid.toUin (bridge caches mappings too)
+        catch { return null; }
+        LearnUin(uid, uin);
+        return string.IsNullOrEmpty(uin) ? null : uin;
+    }
+
+    /// <summary>Cache-backed async resolve used by event handlers.</summary>
+    private async Task<string> ResolveUinCachedAsync(string uid)
+    {
+        if (string.IsNullOrEmpty(uid)) return "";
+        if (!uid.StartsWith('u')) return uid;
+        if (_uidToUin.TryGetValue(uid, out var v) && !string.IsNullOrEmpty(v)) return v;
+        try { return await ResolveUinAsync(uid); }
+        catch { return ""; }
+    }
+
+    /// <summary>Learn a uid->uin pair from any record or list entry.</summary>
+    private void LearnUin(string? uid, string? uin)
+    {
+        if (string.IsNullOrEmpty(uid) || !uid.StartsWith('u')) return;
+        if (string.IsNullOrEmpty(uin) || !uin.All(char.IsDigit)) return;
+        _uidToUin[uid] = uin;
+    }
 
     private void TrimIndex()
     {
         if (_msgIndex.Count <= 5000) return;
-        foreach (var k in _msgIndex.Keys.Take(500))
+        while (_msgIndex.Count > 5000 && _msgIndexOrder.TryDequeue(out var k))
             _msgIndex.TryRemove(k, out _);
+    }
+
+    private void TrimSeqIndex()
+    {
+        if (_seqIndex.Count <= 5000) return;
+        while (_seqIndex.Count > 5000 && _seqIndexOrder.TryDequeue(out var k))
+            _seqIndex.TryRemove(k, out _);
+    }
+
+    private void TrimMarkerIndex()
+    {
+        if (_markerToRealId.Count <= 2000) return;
+        while (_markerToRealId.Count > 2000 && _markerOrder.TryDequeue(out var k))
+            _markerToRealId.TryRemove(k, out _);
+    }
+
+    private void TrimRecallDedup()
+    {
+        if (_recallEmitted.Count <= 2000) return;
+        var cutoff = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - 60000;
+        foreach (var kv in _recallEmitted)
+            if (kv.Value < cutoff) _recallEmitted.TryRemove(kv.Key, out _);
     }
 
     public async Task<Ob11Response> HandleActionAsync(string action, Dictionary<string, object?> p, string? echo)
@@ -717,7 +894,7 @@ public class Ob11Server
                         uid = await ResolveUidAsync(peerUid);
                     var message = Ob11.Get(j, "message");
                     var elements = await Ob11Mapper.SegmentsToElementsAsync(
-                        message, _bridge, _hub, _msgIndex.ToDictionary(x => x.Key, x => x.Value), chatType, uid,
+                        message, _bridge, _hub, _msgIndex, chatType, uid,
                         async uin => (await CallKernel("uin.toUid", new { uin })).TryGetProperty("uid", out var u) ? u.GetString() : null);
                     var autoEscape = Ob11.Bool(j, "auto_escape");
                     if (autoEscape)
@@ -772,12 +949,13 @@ public class Ob11Server
                     {
                         var rec = list[0];
                         var isGroup = Ob11.Long(rec, "chatType") == 2;
-                        var segments = Ob11Mapper.ElementsToSegments(
+                        var segments = await Ob11Mapper.ElementsToSegmentsAsync(
                             rec.TryGetProperty("elements", out var els) ? els : default,
-                            uid => LookupUin(uid));
+                            ResolveUinForMapperAsync);
                         IndexMedia(rec, msgId, Ob11.Long(rec, "chatType"), parts[1]);
                         IndexReplyTargets(segments, Ob11.Long(rec, "chatType"), parts[1]);
-                        var senderUin = Ob11.Str(rec, "senderUin") ?? LookupUin(Ob11.Str(rec, "senderUid") ?? "");
+                        var senderUin = Ob11.Str(rec, "senderUin") ?? await ResolveUinCachedAsync(Ob11.Str(rec, "senderUid") ?? "");
+                        LearnUin(Ob11.Str(rec, "senderUid"), senderUin);
                         var data = new Dictionary<string, object?>
                         {
                             ["time"] = Ob11.Long(rec, "msgTime"),
@@ -912,6 +1090,9 @@ public class Ob11Server
                     {
                         foreach (var m in arr.EnumerateArray())
                         {
+                            // learn uid->uin pairs so at/reply resolution works offline
+                            var memberUid = Ob11.Str(m, "uid");
+                            LearnUin(memberUid, Ob11.Str(m, "uin"));
                             members.Add(new Dictionary<string, object?>
                             {
                                 ["user_id"] = Ob11.Str(m, "uin") ?? "",
@@ -1006,7 +1187,10 @@ public class Ob11Server
                 {
                     var gid = Ob11.Str(j, "group_id") ?? throw new Ob11ParamException("group_id");
                     var uid = await ResolveUidAsync(Ob11.Str(j, "user_id") ?? throw new Ob11ParamException("user_id"));
-                    await CallKernel("group.setCard", new { groupCode = gid, uid, cardName = Ob11.Str(j, "special_title") ?? "" });
+                    // must NOT fall back to group.setCard — that changes the group card,
+                    // not the special title; the kernel method is feature-detected on
+                    // the bridge and errors clearly on builds without it
+                    await CallKernel("group.setSpecialTitle", new { groupCode = gid, uid, specialTitle = Ob11.Str(j, "special_title") ?? "" });
                     return ToElement(new object());
                 }
 
@@ -1173,7 +1357,7 @@ public class Ob11Server
                     var count = Ob11.Long(j, "count", 20);
                     // message_seq=0 means "latest window"; fetch newest-first
                     var r = await CallKernel("msg.historyBySeq", new { chatType = 2, peerUid = gid, msgSeq = seq, count, desc = true });
-                    return BuildHistoryResponse(r, gid);
+                    return await BuildHistoryResponse(r, gid);
                 }
 
             case "get_friend_msg_history":
@@ -1183,7 +1367,7 @@ public class Ob11Server
                     var seq = Ob11.Str(j, "message_seq") ?? "0";
                     var count = Ob11.Long(j, "count", 20);
                     var r = await CallKernel("msg.historyBySeq", new { chatType = 1, peerUid = uid, msgSeq = seq, count, desc = true });
-                    return BuildHistoryResponse(r, uin);
+                    return await BuildHistoryResponse(r, uin);
                 }
 
             case "get_forward_msg":
@@ -1207,15 +1391,15 @@ public class Ob11Server
                         var items = new List<object?>();
                         foreach (var rec in msgList.EnumerateArray())
                         {
-                            var segs = Ob11Mapper.ElementsToSegments(
+                            var segs = await Ob11Mapper.ElementsToSegmentsAsync(
                                 rec.TryGetProperty("elements", out var els) ? els : default,
-                                uid2 => LookupUin(uid2));
+                                ResolveUinForMapperAsync);
                             items.Add(new Dictionary<string, object?>
                             {
                                 ["content"] = segs,
                                 ["sender"] = new Dictionary<string, object?>
                                 {
-                                    ["user_id"] = Ob11.Str(rec, "senderUin") ?? LookupUin(Ob11.Str(rec, "senderUid") ?? ""),
+                                    ["user_id"] = Ob11.Str(rec, "senderUin") ?? await ResolveUinCachedAsync(Ob11.Str(rec, "senderUid") ?? ""),
                                     ["nickname"] = Ob11.Str(rec, "sendNickName") ?? "",
                                 },
                                 ["time"] = Ob11.Long(rec, "msgTime"),
@@ -1282,12 +1466,18 @@ public class Ob11Server
             case "download_file":
                 {
                     var url = Ob11.Str(j, "url") ?? throw new Ob11ParamException("url");
+                    if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                        !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                        throw new Ob11ParamException("url (http/https required)");
                     var dir = Path.Combine(Path.GetTempPath(), "aar", "downloads");
                     Directory.CreateDirectory(dir);
-                    var ext = Path.GetExtension(new Uri(url).AbsolutePath);
+                    string ext;
+                    try { ext = Path.GetExtension(new Uri(url).AbsolutePath); }
+                    catch { throw new Ob11ParamException("url (malformed)"); }
                     if (string.IsNullOrEmpty(ext)) ext = ".bin";
                     var file = Path.Combine(dir, "dl-" + Guid.NewGuid().ToString("N") + ext);
-                    using (var resp2 = await new HttpClient().GetAsync(url))
+                    // shared client: a per-call new HttpClient() leaks sockets
+                    using (var resp2 = await DownloadHttp.GetAsync(url))
                     {
                         resp2.EnsureSuccessStatusCode();
                         await using var fs = File.Create(file);
@@ -1361,22 +1551,20 @@ public class Ob11Server
         try
         {
             var b = await CallKernel("buddy.list", null);
-            var map = new Dictionary<string, string>();
             if (b.TryGetProperty("friends", out var arr) && arr.ValueKind == JsonValueKind.Array)
                 foreach (var f in arr.EnumerateArray())
-                {
-                    var uid = Ob11.Str(f, "uid") ?? "";
-                    var uin = Ob11.Str(f, "uin") ?? "";
-                    if (uid.StartsWith('u') && !string.IsNullOrEmpty(uin)) map[uid] = uin;
-                }
+                    LearnUin(Ob11.Str(f, "uid"), Ob11.Str(f, "uin"));
             var g = await CallKernel("group.list", new { forced = false });
             if (g.TryGetProperty("groups", out var garr) && garr.ValueKind == JsonValueKind.Array)
                 foreach (var grp in garr.EnumerateArray())
                 {
+                    // peer uid for groups is the group code itself
                     var gc = Ob11.Str(grp, "groupCode") ?? "";
-                    if (gc.Length > 0) map[gc] = gc;
+                    if (gc.Length > 0) _uidToUin[gc] = gc;
                 }
-            SetUinLookup(uid => map.TryGetValue(uid, out var v) ? v : null);
+            // keep a snapshot delegate as a fallback layer for LookupUin
+            var snap = new Dictionary<string, string>(_uidToUin);
+            _primedUinLookup = uid => snap.TryGetValue(uid, out var v) ? v : null;
         }
         catch (Exception ex) { _logger.LogWarning(ex, "prime uin lookup failed"); }
     }
@@ -1394,15 +1582,16 @@ public class Ob11Server
         try { EventEmitted?.Invoke(json); }
         catch (Exception ex) { _logger.LogWarning(ex, "event subscriber failed (isolated)"); }
 
+        var bytes = System.Text.Encoding.UTF8.GetBytes(json);
         foreach (var kv in _wsClients)
         {
             var ws = kv.Value;
             try
             {
                 if (ws.State != System.Net.WebSockets.WebSocketState.Open) { RemoveWsClient(kv.Key); continue; }
-                var bytes = System.Text.Encoding.UTF8.GetBytes(json);
-                await ws.SendAsync(new ArraySegment<byte>(bytes),
-                    System.Net.WebSockets.WebSocketMessageType.Text, true, CancellationToken.None);
+                // per-connection send lock: parallel WebSocket.SendAsync on one socket
+                // throws InvalidOperationException and would drop the client
+                await SendWsFrameAsync(kv.Key, ws, bytes);
             }
             catch { RemoveWsClient(kv.Key); }
         }

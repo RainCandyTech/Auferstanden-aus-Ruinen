@@ -104,6 +104,7 @@ AaR.Server 读取同目录 `appsettings.json` 的 `AaR` 段：
     "Ob11WsPath": "/ws",            // 正向 WS 端点
     "BridgeTimeoutMs": 15000,       // 内核 RPC 超时
     "HeartbeatIntervalMs": 30000,   // 心跳间隔
+    "RequireBridgeForHttp": true,   // 桥接未连接时 HTTP API 返回 503（不再是无用的死配置）
     "EnableDebugKernel": false,     // debug_kernel 诊断透传（默认关闭）
     "Reverse": {
       "WebSockets": [               // 反向 WS 目标（框架侧 WS 服务地址）

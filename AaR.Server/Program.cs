@@ -33,12 +33,7 @@ var app = builder.Build();
 var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
 lifetime.ApplicationStopping.Register(() =>
 {
-    try
-    {
-        var ob = app.Services.GetRequiredService<Ob11Server>();
-        var f = typeof(Ob11Server).GetField("_shutdownCts", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        (f?.GetValue(ob) as CancellationTokenSource)?.Cancel();
-    }
+    try { app.Services.GetRequiredService<Ob11Server>().Shutdown(); }
     catch { }
 });
 
@@ -51,6 +46,16 @@ var ob11 = app.Services.GetRequiredService<Ob11Server>();
 async Task<IResult> HandleOb11Action(HttpContext ctx, string action, Dictionary<string, object?> parameters)
 {
     if (string.IsNullOrWhiteSpace(action)) return Results.BadRequest();
+    // auth first: with an AccessToken configured, every OB11 HTTP surface requires
+    // it (Bearer header / access_token header / access_token query) — previously
+    // these endpoints were completely unauthenticated
+    if (!AaRAuth.Check(ctx, opts))
+        return Results.Json(Ob11Response.Fail(Ob11.RetUnsupported, "access token denied"),
+            statusCode: 401, contentType: "application/json; charset=utf-8");
+    // honor the (previously dead) config: reject OB11 calls until the bridge is up
+    if (opts.RequireBridgeForHttp && !registry.IsBridgeConnected)
+        return Results.Json(Ob11Response.Fail(Ob11.RetUnsupported, "bridge not connected"),
+            statusCode: 503, contentType: "application/json; charset=utf-8");
     var echo = ctx.Request.Query["echo"].ToString();
     if (string.IsNullOrEmpty(echo) && ctx.Request.Headers.TryGetValue("x-echo", out var hEcho)) echo = hEcho;
 

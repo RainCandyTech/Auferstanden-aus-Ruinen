@@ -44,6 +44,8 @@ public class ReversePushService : BackgroundService
     private readonly ConcurrentQueue<string> _queue = new();
     private readonly List<(ReverseWsTarget Target, ClientWebSocket? Ws)> _sockets = new();
     private readonly object _socketsLock = new();
+    // per-target send locks: concurrent WebSocket.SendAsync on one socket throws
+    private readonly ConcurrentDictionary<int, SemaphoreSlim> _wsSendLocks = new();
     private readonly HttpClient _http = new() { Timeout = Timeout.InfiniteTimeSpan };
     private string SelfUin => _ob11.SelfUin;
 
@@ -118,7 +120,7 @@ public class ReversePushService : BackgroundService
                 // announce self id on connect (spec: X-Self-ID header equivalent in-band)
                 try
                 {
-                    await SendFrameAsync(ws, Ob11Json.Serialize(new Dictionary<string, object?>
+                    await SendFrameAsync(idx, ws, Ob11Json.Serialize(new Dictionary<string, object?>
                     {
                         ["time"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
                         ["self_id"] = SelfUin,
@@ -150,7 +152,7 @@ public class ReversePushService : BackgroundService
                     if (result.MessageType == WebSocketMessageType.Close) break;
                     var text = Encoding.UTF8.GetString(ms.ToArray());
                     _logger.LogInformation("reverse-ws frame received ({Len} bytes)", text.Length);
-                    _ = HandleReverseApiFrameAsync(ws, text, ct);
+                    _ = HandleReverseApiFrameAsync(idx, ws, text, ct);
                 }
             }
             catch (OperationCanceledException) { break; }
@@ -170,7 +172,7 @@ public class ReversePushService : BackgroundService
         }
     }
 
-    private async Task HandleReverseApiFrameAsync(ClientWebSocket ws, string text, CancellationToken ct)
+    private async Task HandleReverseApiFrameAsync(int idx, ClientWebSocket ws, string text, CancellationToken ct)
     {
         string? echo = null;
         try
@@ -185,35 +187,51 @@ public class ReversePushService : BackgroundService
                     p[prop.Name] = prop.Value.Clone();
 
             var response = await _ob11.HandleActionAsync(action, p, echo);
-            await SendFrameAsync(ws, Ob11Json.Serialize(response), ct);
+            await SendFrameAsync(idx, ws, Ob11Json.Serialize(response), ct);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "reverse-ws api frame failed");
-            try { await SendFrameAsync(ws, Ob11Json.Serialize(Ob11Response.Fail(-1, ex.Message, echo: echo)), ct); }
+            try { await SendFrameAsync(idx, ws, Ob11Json.Serialize(Ob11Response.Fail(-1, ex.Message, echo: echo)), ct); }
             catch { }
         }
     }
 
-    private static async Task SendFrameAsync(ClientWebSocket ws, string json, CancellationToken ct)
+    private async Task SendFrameAsync(int idx, ClientWebSocket ws, string json, CancellationToken ct)
     {
         if (ws.State != WebSocketState.Open) return;
-        var bytes = Encoding.UTF8.GetBytes(json);
-        await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, ct);
+        var l = _wsSendLocks.GetOrAdd(idx, _ => new SemaphoreSlim(1, 1));
+        await l.WaitAsync(ct);
+        try
+        {
+            if (ws.State != WebSocketState.Open) return;
+            var bytes = Encoding.UTF8.GetBytes(json);
+            await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, ct);
+        }
+        finally { l.Release(); }
     }
 
     private async Task FanOutWsAsync(string json, CancellationToken ct)
     {
+        List<Task> sends;
         lock (_socketsLock)
         {
-            foreach (var (_, ws) in _sockets)
+            sends = new List<Task>();
+            foreach (var (i, ws) in _sockets.Select((s, i) => (i, s.Ws)))
             {
                 if (ws is { State: WebSocketState.Open })
                 {
-                    try { _ = SendFrameAsync(ws, json, ct); } catch { }
+                    // fire-and-forget but with the per-connection send lock held
+                    // until the frame is written
+                    sends.Add(Task.Run(async () =>
+                    {
+                        try { await SendFrameAsync(i, ws, json, ct); }
+                        catch { /* reconnect loop owns failures */ }
+                    }, CancellationToken.None));
                 }
             }
         }
+        try { await Task.WhenAll(sends); } catch { /* individual failures logged by loops */ }
     }
 
     // ---------- reverse HTTP POST ----------

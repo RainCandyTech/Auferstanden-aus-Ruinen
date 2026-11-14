@@ -18,7 +18,7 @@ public static class Ob11Mapper
 
     public static async Task<List<Dictionary<string, object?>>> SegmentsToElementsAsync(
         JsonElement message, BridgeRegistry registry, IHubContext<AaRHub> hub,
-        Dictionary<string, string> msgIdToPeer, int chatType, string peerUidForReply,
+        IReadOnlyDictionary<string, string> msgIdToPeer, int chatType, string peerUidForReply,
         Func<string, Task<string?>> resolveUidAsync)
     {
         var elements = new List<Dictionary<string, object?>>();
@@ -155,8 +155,10 @@ public static class Ob11Mapper
                     {
                         var vid = await BuildStagedElementAsync(registry, hub, S("file"), kind: "video", elementType: 5, extHint: "mp4");
                         if (vid is null) throw new Ob11BadException("video file not resolvable: " + S("file"));
-                        // thumbnail: NT wants a real file at Thumb/<md5>_0.png inside the media store
-                        var thumbPng = DefaultVideoThumb();
+                        // thumbnail: NT wants a real file at Thumb/<md5>_0.png inside the media
+                        // store — grab a real frame via ffmpeg when available, else fall back
+                        // to the minimal dark placeholder
+                        var thumbPng = await TryExtractVideoThumbAsync(vid.Value.path) ?? DefaultVideoThumb();
                         var staged = await KernelAsync(registry, hub, "msg.prepareMedia", new
                         {
                             srcPath = vid.Value.path,
@@ -166,6 +168,8 @@ public static class Ob11Mapper
                             thumbPngBase64 = Convert.ToBase64String(thumbPng),
                         });
                         var (tw, th) = ProbeImageSize(thumbPng);
+                        // real duration from the MP4 mvhd box when parseable
+                        var durationSec = ProbeMp4DurationSeconds(vid.Value.path);
                         elements.Add(new Dictionary<string, object?>
                         {
                             ["elementType"] = 5,
@@ -176,7 +180,7 @@ public static class Ob11Mapper
                                 ["filePath"] = Str2(staged, "path") ?? vid.Value.path,
                                 ["videoMd5"] = vid.Value.md5,
                                 ["thumbMd5"] = Str2(staged, "thumbMd5HexStr") ?? "",
-                                ["fileTime"] = 15,
+                                ["fileTime"] = durationSec > 0 ? durationSec : 15,
                                 ["thumbPath"] = new Dictionary<string, object?> { ["0"] = Str2(staged, "thumbPath") ?? "" },
                                 ["thumbSize"] = Ob11.Long(staged, "thumbSize", thumbPng.Length),
                                 ["thumbWidth"] = tw > 0 ? tw : 320,
@@ -297,7 +301,11 @@ public static class Ob11Mapper
         int i = 0;
         while (i < raw.Length)
         {
-            if (raw[i] == '[' && i + 1 < raw.Length && raw[i + 1] == 'C' && raw.IndexOf(']', i) > 0)
+            // only treat "[CQ:" as a CQ code opener — a plain bracket followed by 'C'
+            // ("[CPP]", "[Chrome]", ...) is ordinary text and must be preserved
+            if (raw[i] == '[' && i + 4 <= raw.Length &&
+                raw[i + 1] == 'C' && raw[i + 2] == 'Q' && raw[i + 3] == ':' &&
+                raw.IndexOf(']', i) > i + 4)
             {
                 var end = raw.IndexOf(']', i);
                 var body = raw[(i + 4)..end]; // skip [CQ:
@@ -385,6 +393,117 @@ public static class Ob11Mapper
         Chunk("IDAT", Compress(raw));
         Chunk("IEND", Array.Empty<byte>());
         return ms.ToArray();
+    }
+
+    private static string? _ffmpegPath;
+
+    /// <summary>Locate ffmpeg on PATH (result cached; empty string = negative cache).</summary>
+    private static string? FindFfmpeg()
+    {
+        if (_ffmpegPath is not null) return _ffmpegPath.Length > 0 ? _ffmpegPath : null;
+        var dirs = new List<string>();
+        var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? "";
+        dirs.AddRange(pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        dirs.AddRange(new[] { "/usr/local/bin", "/usr/bin", "/snap/bin" });
+        foreach (var d in dirs)
+        {
+            if (d.Length == 0) continue;
+            foreach (var n in new[] { "ffmpeg", "ffmpeg.exe" })
+            {
+                var p = Path.Combine(d, n);
+                if (File.Exists(p)) { _ffmpegPath = p; return p; }
+            }
+        }
+        _ffmpegPath = "";
+        return null;
+    }
+
+    /// <summary>
+    /// Grab one frame as PNG via ffmpeg (null when ffmpeg is unavailable, times out
+    /// or fails). Never throws — callers fall back to the placeholder thumbnail.
+    /// </summary>
+    private static async Task<byte[]?> TryExtractVideoThumbAsync(string videoPath)
+    {
+        var ffmpeg = FindFfmpeg();
+        if (ffmpeg is null || !File.Exists(videoPath)) return null;
+        foreach (var seek in new[] { "1", "0" }) // 1s in; retry at 0 for very short clips
+        {
+            try
+            {
+                using var proc = new System.Diagnostics.Process();
+                proc.StartInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = ffmpeg,
+                    Arguments = "-y -v error -ss " + seek + " -i \"" + videoPath +
+                                "\" -frames:v 1 -f image2pipe -vcodec png pipe:1",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                };
+                proc.Start();
+                using var outMs = new MemoryStream();
+                var readTask = proc.StandardOutput.BaseStream.CopyToAsync(outMs);
+                var finished = await Task.WhenAny(readTask, Task.Delay(10000));
+                if (finished != readTask)
+                {
+                    try { proc.Kill(true); } catch { }
+                    continue;
+                }
+                await proc.WaitForExitAsync();
+                var png = outMs.ToArray();
+                if (png.Length > 8 && png[0] == 0x89 && png[1] == 0x50 && png[2] == 0x4E && png[3] == 0x47)
+                    return png;
+            }
+            catch { /* try next seek / fall back */ }
+        }
+        return null;
+    }
+
+    /// <summary>Read the real duration (seconds) from the MP4 mvhd box; 0 when unavailable.</summary>
+    private static long ProbeMp4DurationSeconds(string path)
+    {
+        try
+        {
+            using var fs = File.OpenRead(path);
+            var len = fs.Length;
+            if (len < 32) return 0;
+            // moov (faststart) sits at the head; otherwise it is usually at the tail
+            foreach (var off in new long[] { 0, Math.Max(0, len - (1 << 20)) })
+            {
+                if (off >= len) continue;
+                fs.Position = off;
+                var cap = (int)Math.Min(1 << 20, len - off);
+                var buf = new byte[cap];
+                var read = 0;
+                while (read < cap)
+                {
+                    var n = fs.Read(buf, read, cap - read);
+                    if (n <= 0) break;
+                    read += n;
+                }
+                for (int i = 0; i + 8 <= read; i++)
+                {
+                    if (buf[i] != 'm' || buf[i + 1] != 'v' || buf[i + 2] != 'h' || buf[i + 3] != 'd') continue;
+                    var ver = buf[i + 4];
+                    // layout from the 'mvhd' signature: version(1) flags(3)
+                    // v0: creation(4) modification(4) timescale(4) duration(4)
+                    // v1: creation(8) modification(8) timescale(4) duration(8)
+                    int tsOff, duOff, duLen;
+                    if (ver == 1) { tsOff = i + 24; duOff = i + 28; duLen = 8; }
+                    else { tsOff = i + 16; duOff = i + 20; duLen = 4; }
+                    if (tsOff + 4 > read || duOff + duLen > read) break;
+                    uint timescale = (uint)((buf[tsOff] << 24) | (buf[tsOff + 1] << 16) | (buf[tsOff + 2] << 8) | buf[tsOff + 3]);
+                    ulong duration = 0;
+                    if (duLen == 8) for (int k = 0; k < 8; k++) duration = (duration << 8) | buf[duOff + k];
+                    else duration = (uint)((buf[duOff] << 24) | (buf[duOff + 1] << 16) | (buf[duOff + 2] << 8) | buf[duOff + 3]);
+                    if (timescale > 0 && duration > 0)
+                        return (long)(duration / timescale);
+                    break;
+                }
+            }
+        }
+        catch { }
+        return 0;
     }
 
     private static uint[]? _crcTable;
@@ -600,7 +719,13 @@ public static class Ob11Mapper
 
     // ---------- internal elements -> OB11 segments ----------
 
-    public static List<Dictionary<string, object?>> ElementsToSegments(JsonElement elements, Func<string, string?> uidToUin)
+    /// <summary>
+    /// Internal elements -> OB11 segments. The uid resolver may hit the kernel
+    /// (uid.toUin) asynchronously, so unknown uids resolve correctly even before
+    /// any friend/group list was fetched (cached server-side after first hit).
+    /// </summary>
+    public static async Task<List<Dictionary<string, object?>>> ElementsToSegmentsAsync(
+        JsonElement elements, Func<string, Task<string?>> uidToUin)
     {
         var segments = new List<Dictionary<string, object?>>();
         if (elements.ValueKind != JsonValueKind.Array) return segments;
@@ -627,9 +752,9 @@ public static class Ob11Mapper
                     if (!string.IsNullOrEmpty(atUid) && atUid.All(char.IsDigit))
                         uin = atUid;
                     else if (!string.IsNullOrEmpty(atNtUid))
-                        uin = uidToUin(atNtUid) ?? (atNtUid.All(char.IsDigit) ? atNtUid : null);
+                        uin = await uidToUin(atNtUid) ?? (atNtUid.All(char.IsDigit) ? atNtUid : null);
                     else if (!string.IsNullOrEmpty(atUid))
-                        uin = uidToUin(atUid);
+                        uin = await uidToUin(atUid);
                     segments.Add(Seg("at", new Dictionary<string, object?> { ["qq"] = uin ?? "" }));
                 }
                 if (content.Length > 0) segments.Add(Seg("text", new Dictionary<string, object?> { ["text"] = content }));

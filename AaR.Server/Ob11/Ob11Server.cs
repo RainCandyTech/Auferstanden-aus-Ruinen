@@ -21,6 +21,9 @@ public class Ob11Server
     public volatile string SelfUin = "";
     public volatile string SelfNick = "";
 
+    /// <summary>Server version reported by get_version_info and the #AaR debug command.</summary>
+    public const string ServerVersion = "0.3.0";
+
     // msgId -> "chatType|peerUid|seq" for delete_msg / get_msg / reply building
     private readonly ConcurrentDictionary<string, string> _msgIndex = new();
     // FIFO eviction queues for the bounded in-memory indexes: unlike the previous
@@ -51,6 +54,9 @@ public class Ob11Server
     // per-connection send locks: concurrent WebSocket.SendAsync on one socket
     // throws InvalidOperationException (.NET forbids parallel sends)
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _wsSendLocks = new();
+    // #AaR debug command: last trigger tick per peer ("chatType|peerUid") for a
+    // small anti-spam / anti-loop cooldown
+    private readonly ConcurrentDictionary<string, long> _debugCmdPeerTick = new();
 
     /// <summary>Force OneBot id-ish fields to strings (JS frameworks overflow >2^53 ints).</summary>
     private static void NormalizeIdFields(Dictionary<string, object?> evt)
@@ -249,6 +255,12 @@ public class Ob11Server
 
             IndexMedia(rec, msgId, chatType, peerUid);
             IndexReplyTargets(segments, chatType, peerUid);
+
+            // #AaR in-chat debug command: fire-and-forget so a slow kernel send
+            // never delays event mapping; self-sent records are skipped to
+            // guarantee the reply can never re-trigger the command
+            if (_opts.EnableDebugCommand && senderUid != SelfUid)
+                _ = TryHandleDebugCommandAsync(chatType, peerUid, senderUid, senderUin, msgId, segments);
 
             var evt = new Dictionary<string, object?>
             {
@@ -628,6 +640,135 @@ public class Ob11Server
                 });
             }
         }
+    }
+
+    // ================= #AaR in-chat debug command =================
+
+    private const string DebugCommandText = "#AaR";
+    private static readonly TimeSpan DebugCommandCooldown = TimeSpan.FromSeconds(5);
+
+    private void TrimDebugCmdPeers(long nowMs)
+    {
+        if (_debugCmdPeerTick.Count <= 500) return;
+        foreach (var kv in _debugCmdPeerTick)
+            if (nowMs - kv.Value > 60000) _debugCmdPeerTick.TryRemove(kv.Key, out _);
+    }
+
+    /// <summary>Plain text content of a segment list (text segments concatenated).</summary>
+    private static string PlainTextOf(List<Dictionary<string, object?>> segments)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var s in segments)
+            if (s.TryGetValue("type", out var t) && t?.ToString() == "text" &&
+                s.TryGetValue("data", out var d) && d is Dictionary<string, object?> dd &&
+                dd.TryGetValue("text", out var tx))
+                sb.Append(tx);
+        return sb.ToString();
+    }
+
+    /// <summary>Keep only the last 4 characters of an id (chat-safe masking).</summary>
+    private static string MaskId(string? id)
+    {
+        if (string.IsNullOrEmpty(id)) return "(未知)";
+        return id.Length <= 4 ? "****" : "****" + id[^4..];
+    }
+
+    private static string FormatUptime(TimeSpan t) =>
+        $"{(int)t.TotalDays}d{t.Hours}h{t.Minutes}m{t.Seconds}s";
+
+    /// <summary>
+    /// Handles the "#AaR" chat command: full diagnostics go to the server log,
+    /// a sanitized one-screen summary is replied directly into the same chat.
+    /// Never throws — failures are logged and swallowed.
+    /// </summary>
+    private async Task TryHandleDebugCommandAsync(
+        long chatType, string peerUid, string senderUid, string senderUin, string msgId,
+        List<Dictionary<string, object?>> segments)
+    {
+        try
+        {
+            var text = PlainTextOf(segments).Trim();
+            if (!string.Equals(text, DebugCommandText, StringComparison.Ordinal)) return;
+
+            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var peerKey = $"{chatType}|{peerUid}";
+            if (_debugCmdPeerTick.TryGetValue(peerKey, out var last) && nowMs - last < DebugCommandCooldown.TotalMilliseconds)
+                return;
+            _debugCmdPeerTick[peerKey] = nowMs;
+            TrimDebugCmdPeers(nowMs);
+
+            // full, unmasked diagnostics -> server log (operator eyes only)
+            _logger.LogInformation(
+                "#AaR debug command in {ChatType}: peer={PeerUid} senderUid={SenderUid} senderUin={SenderUin} msgId={MsgId}{NewLine}{FullInfo}",
+                chatType == 2 ? "group" : "private",
+                peerUid, senderUid, senderUin, msgId,
+                Environment.NewLine, BuildFullDebugInfo());
+
+            // sanitized summary -> chat reply via the kernel
+            var reply = BuildSanitizedDebugInfo(chatType);
+            var elements = new List<Dictionary<string, object?>> { Ob11Mapper.TextEl(reply) };
+            await CallKernel("msg.send", new { chatType, peerUid, elements });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "#AaR debug reply failed for peer {Peer}", peerUid);
+        }
+    }
+
+    /// <summary>Sanitized status summary for the chat reply (no uins/uids/urls/tokens).</summary>
+    private string BuildSanitizedDebugInfo(long chatType)
+    {
+        var uptime = FormatUptime(DateTime.UtcNow - _startedAt);
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("AaR 运行状态（脱敏摘要，完整信息仅写入服务端日志）");
+        sb.AppendLine($"版本: AaR {ServerVersion}");
+        sb.AppendLine($"运行时长: {uptime}");
+        sb.AppendLine($"桥接内核: {(_bridge.IsBridgeConnected ? "已连接" : "未连接")}");
+        sb.AppendLine($"事件: 收 {EventsReceived} / 发 {EventsBroadcast}");
+        sb.AppendLine($"WS 客户端: {_wsClients.Count}");
+        sb.AppendLine($"会话索引: 消息 {_msgIndex.Count} / 媒体 {_mediaIndex.Count} / uid 缓存 {_uidToUin.Count}");
+        sb.AppendLine($"鉴权令牌: {(string.IsNullOrEmpty(_opts.AccessToken) ? "未配置" : "已配置")}");
+        sb.AppendLine($"本机 QQ: {MaskId(SelfUin)}");
+        sb.AppendLine($"来源: {(chatType == 2 ? "群聊" : "私聊")}");
+        return sb.ToString().TrimEnd();
+    }
+
+    /// <summary>Full diagnostics for the server log.</summary>
+    private string BuildFullDebugInfo()
+    {
+        var sb = new System.Text.StringBuilder();
+        string ReverseTokenCount<T>(List<T>? list, Func<T, string?> token) =>
+            list is null ? "-" : $"{list.Count(x => !string.IsNullOrEmpty(token(x)))}/{list.Count}";
+        try
+        {
+            using var proc = System.Diagnostics.Process.GetCurrentProcess();
+            sb.AppendLine("==== AaR debug info (full) ====");
+            sb.AppendLine($"version     : AaR {ServerVersion}");
+            sb.AppendLine($"runtime     : {System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription}");
+            sb.AppendLine($"os          : {System.Runtime.InteropServices.RuntimeInformation.OSDescription}");
+            sb.AppendLine($"uptime      : session {FormatUptime(DateTime.UtcNow - _startedAt)} / process {FormatUptime(DateTime.Now - proc.StartTime)}");
+            sb.AppendLine($"memory      : working set {proc.WorkingSet64 / 1024 / 1024} MB, GC heap {GC.GetTotalMemory(false) / 1024 / 1024} MB, threads {proc.Threads.Count}");
+            sb.AppendLine($"self        : uin={SelfUin} uid={SelfUid} nick={SelfNick}");
+            sb.AppendLine($"bridge      : {(_bridge.IsBridgeConnected ? "connected" : "NOT connected")}");
+            sb.AppendLine($"auth        : token {(string.IsNullOrEmpty(_opts.AccessToken) ? "NOT set (auth disabled)" : $"set ({_opts.AccessToken.Length} chars)")}");
+            sb.AppendLine($"endpoints   : hub={_opts.BridgeHubPath} ws={_opts.Ob11WsPath}");
+            sb.AppendLine($"flags       : RequireBridgeForHttp={_opts.RequireBridgeForHttp} EnableDebugKernel={_opts.EnableDebugKernel} EnableDebugCommand={_opts.EnableDebugCommand}");
+            sb.AppendLine($"reverse-ws  : targets with token {ReverseTokenCount(_opts.Reverse?.WebSockets, t => t.AccessToken)}");
+            foreach (var t in _opts.Reverse?.WebSockets ?? [])
+                sb.AppendLine($"  ws  -> {t.Url} (reconnect {t.ReconnectMs}ms, token {(string.IsNullOrEmpty(t.AccessToken) ? "no" : "yes")})");
+            sb.AppendLine($"reverse-http: targets with token {ReverseTokenCount(_opts.Reverse?.HttpPost, t => t.AccessToken)}");
+            foreach (var t in _opts.Reverse?.HttpPost ?? [])
+                sb.AppendLine($"  http -> {t.Url} (token {(string.IsNullOrEmpty(t.AccessToken) ? "no" : "yes")})");
+            sb.AppendLine($"events      : received={EventsReceived} broadcast={EventsBroadcast}");
+            sb.AppendLine($"ob11-ws     : clients={_wsClients.Count}");
+            sb.AppendLine($"indexes     : msg={_msgIndex.Count}/5000 seq={_seqIndex.Count}/5000 media={_mediaIndex.Count}/3000 uidCache={_uidToUin.Count} markers={_markerToRealId.Count}/2000");
+            sb.AppendLine($"debug-cmd   : cooldown peers tracked={_debugCmdPeerTick.Count}");
+        }
+        catch (Exception ex)
+        {
+            sb.AppendLine($"(full info generation error: {ex.Message})");
+        }
+        return sb.ToString().TrimEnd();
     }
 
     // ================= OB11 action dispatch =================
@@ -1260,10 +1401,10 @@ public class Ob11Server
                 return ToElement(new Dictionary<string, object?>
                 {
                     ["app_name"] = "AaR",
-                    ["app_version"] = "0.3.0",
+                    ["app_version"] = ServerVersion,
                     ["protocol_version"] = Ob11.ProtocolVersion,
                     ["coolq_edition"] = "AaR",
-                    ["plugin_version"] = "0.3.0",
+                    ["plugin_version"] = ServerVersion,
                 });
 
             case "get_image":

@@ -105,6 +105,7 @@ AaR.Server 读取同目录 `appsettings.json` 的 `AaR` 段：
     "BridgeTimeoutMs": 15000,       // 内核 RPC 超时
     "HeartbeatIntervalMs": 30000,   // 心跳间隔
     "RequireBridgeForHttp": true,   // 桥接未连接时 HTTP API 返回 503（不再是无用的死配置）
+    "EnableDebugCommand": true,     // #AaR 聊天调试命令（见下文）；设为 false 可关闭
     "EnableDebugKernel": false,     // debug_kernel 诊断透传（默认关闭）
     "Reverse": {
       "WebSockets": [               // 反向 WS 目标（框架侧 WS 服务地址）
@@ -120,6 +121,22 @@ AaR.Server 读取同目录 `appsettings.json` 的 `AaR` 段：
 
 日志与运行数据写在同目录。桥接模块侧有独立的 `aar-config.json`
 （服务器地址与令牌），与 AaR.Server 的 `AccessToken` 保持一致。
+
+## 聊天调试命令 `#AaR`
+
+任何私聊/群聊中发送内容恰为 `#AaR` 的消息（`AaR:EnableDebugCommand`，
+默认开启，设为 `false` 关闭），协议端会直接回复一条**脱敏**运行摘要：
+
+- 版本、运行时长、桥接连接状态、事件收发计数、WS 客户端数
+- 会话索引规模、鉴权令牌是否配置、来源（群聊/私聊）
+- 所有 id 均掩码显示（如 `****7890`），不包含任何 uid/uin/URL/令牌
+
+同时完整（未脱敏）诊断信息——运行时、内存、进程、自我身份、端点配置、
+反向目标、索引明细——只写入服务端日志（`#AaR debug command` 条目），
+聊天侧不可见。
+
+- 同一会话 5 秒内重复触发会被静默忽略（防刷屏/防回环）
+- 触发消息本身照常向框架广播，机器人自己的消息不会触发
 
 ## 关于部署
 

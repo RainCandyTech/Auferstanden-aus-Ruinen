@@ -11,6 +11,12 @@ public class AaROptions
     public bool RequireBridgeForHttp { get; set; } = true;
     /// <summary>Enable the diagnostic debug_kernel action (raw kernel method passthrough).</summary>
     public bool EnableDebugKernel { get; set; } = false;
+    /// <summary>
+    /// Enable the in-chat #AaR debug command: a chat message consisting of exactly
+    /// "#AaR" gets a sanitized status summary as a direct reply, and the full
+    /// (unmasked) diagnostics are written to the server log. Set false to disable.
+    /// </summary>
+    public bool EnableDebugCommand { get; set; } = true;
     public Services.ReverseOptions Reverse { get; set; } = new();
 }
 

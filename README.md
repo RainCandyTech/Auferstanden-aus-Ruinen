@@ -12,25 +12,27 @@ AaR 从废墟中站起，接过了这个位置。
 | 仓库 | 内容 | 可见性 |
 |---|---|---|
 | **AaR-Public**（本仓库） | AaR.Server 全部源码；Release 二进制经 GitHub Releases 分发 | 公开 |
-| **AaR-RPCBridge** | 桥接模块（混淆 JavaScript）源码、构建与部署脚本 | 私有 |
+| **AaR-RPCBridge** | 桥接模块源码（JS 桥 + Native Hook 桥）、构建与部署脚本 | 私有 |
 | **AaR-Test** | 测试代码、协议验证数据与测试报告 | 私有 |
 
-Release 产物（服务端 .NET 构建 + 混淆后的桥接模块）不上传到 git，
+Release 产物（服务端 .NET 构建 + JS 桥 + Native 桥）不上传到 git，
 统一发布在 GitHub Releases 页面。
 
 ---
 
 ## 这是什么
 
-AaR 是面向 **QQ NT Linux 客户端（3.2.x）** 的 OneBot v11 协议端实现，由两部分组成：
+AaR 是面向 **QQ NT Linux 客户端（3.2.x）** 的 OneBot v11 协议端实现，由服务端与桥接模块组成：
 
 | 组件 | 形态 | 职责 |
 |---|---|---|
 | **AaR.Server** | .NET 二进制 | OneBot v11 协议端本体：全部协议逻辑、传输通道、事件转换、对外接口 |
-| **桥接模块** | 混淆 JavaScript | 运行于 QQ NT 主进程内部，**仅**将 RPC 调用转换为客户端内核函数调用、推送内核事件。不含任何协议逻辑 |
+| **JS 桥** | JavaScript（**0.4.1 起明文分发**） | 运行于 QQ NT 主进程内部，**仅**将 RPC 调用转换为客户端内核函数调用、推送内核事件。不含任何协议逻辑 |
+| **Native Hook 桥** ⚠️ 实验性 | C++ / LD_PRELOAD（0.4.1 新增） | 同上职责的零 JS 注入形态：GOT 补丁截获 wrapper.node 的 NAPI 调用直驱内核。**预览形态**——长稳回归与部署工具化未完成，生产环境仍以 JS 桥为准 |
 
 协议端与桥接模块之间通过 SignalR 双向 RPC 通信。桥接模块对协议一无所知——
-这一隔离是刻意设计的，也是本项目选择混淆分发而非开源分发的部分原因。
+这一隔离是刻意设计的。JS 桥自 0.4.1 起以明文分发（此前为混淆分发）；
+两种桥接形态与 AaR.Server 的契约完全一致，同机二选一运行。
 
 ## 运行环境
 
@@ -144,8 +146,11 @@ AaR.Server 读取同目录 `appsettings.json` 的 `AaR` 段：
 QQ NT 的入口解析链路（`package.json` 主字段、`app_launcher` 与内嵌虚拟文件系统
 之间的关系）值得自行研究——提示到此为止，剩下的动手部分属于使用者的功课。
 
-桥接模块具备自动重连与内核会话自愈能力；QQ 重启、登录状态变化、AaR.Server
+JS 桥具备自动重连与内核会话自愈能力；QQ 重启、登录状态变化、AaR.Server
 重启均不需要人工干预。
+
+Native Hook 桥（实验性）以 `LD_PRELOAD` 方式注入 QQ 主进程，与 JS 桥二选一
+运行；详见 Releases 页面的版本说明。
 
 ## 兼容性备忘
 
@@ -189,7 +194,7 @@ offtopic讨论区：1136101939
 ## 许可证
 
 - **源码**（本仓库 AaR.Server 目录）：AGPL-3.0，见 [LICENSE](LICENSE)
-- **Release 二进制**（GitHub Releases 分发的构建产物与混淆桥接模块）：CC BY-NC-ND 4.0
+- **Release 二进制**（GitHub Releases 分发的构建产物与桥接模块）：CC BY-NC-ND 4.0
   （署名-非商业性使用-禁止演绎），见 [LICENSE-RELEASE](LICENSE-RELEASE)
 
 使用即表示接受上述许可条款。

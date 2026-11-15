@@ -6,7 +6,7 @@ public class AaROptions
     public string AccessToken { get; set; } = "";
     public string BridgeHubPath { get; set; } = "/hub/aar";
     public string Ob11WsPath { get; set; } = "/ws";
-    public int BridgeTimeoutMs { get; set; } = 15000;
+    public int BridgeTimeoutMs { get; set; } = 45000;
     public int HeartbeatIntervalMs { get; set; } = 30000;
     public bool RequireBridgeForHttp { get; set; } = true;
     /// <summary>Enable the diagnostic debug_kernel action (raw kernel method passthrough).</summary>

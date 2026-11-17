@@ -25,6 +25,8 @@ public class AaROptions
     public string QQVersionJsonPath { get; set; } = "/opt/QQ/resources/app/package.json";
     /// <summary>Allow set_restart to terminate the process (service manager restarts it).</summary>
     public bool AllowRestart { get; set; } = true;
+    /// <summary>silk_v3_encoder（kn007/silk-v3-decoder 编译产物，-tencent QQ 兼容流）路径。</summary>
+    public string SilkEncoderPath { get; set; } = "/opt/aar/bin/silk_v3_encoder";
     /// <summary>OB11 storage: EF Core + SQLite ("sqlite" persisted / "memory" shared-cache in-memory).</summary>
     public StorageOptions Storage { get; set; } = new();
     public Services.ReverseOptions Reverse { get; set; } = new();

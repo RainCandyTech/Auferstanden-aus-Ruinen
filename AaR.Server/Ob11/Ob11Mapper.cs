@@ -19,7 +19,7 @@ public static class Ob11Mapper
     public static async Task<List<Dictionary<string, object?>>> SegmentsToElementsAsync(
         JsonElement message, BridgeRegistry registry, IHubContext<AaRHub> hub,
         IReadOnlyDictionary<string, string> msgIdToPeer, int chatType, string peerUidForReply,
-        Func<string, Task<string?>> resolveUidAsync)
+        Func<string, Task<string?>> resolveUidAsync, string silkEncoderPath = "/opt/aar/bin/silk_v3_encoder")
     {
         var elements = new List<Dictionary<string, object?>>();
         var segments = NormalizeSegments(message);
@@ -119,24 +119,55 @@ public static class Ob11Mapper
 
                 case "record":
                     {
-                        var ptt = await BuildStagedElementAsync(registry, hub, S("file"), kind: "record", elementType: 4, extHint: "amr");
-                        if (ptt is null) throw new Ob11BadException("record file not resolvable: " + S("file"));
-                        var ext = Path.GetExtension(ptt.Value.path).ToLowerInvariant();
-                        var bytes = await File.ReadAllBytesAsync(ptt.Value.path);
-                        // duration heuristic: AMR 12.2kbps ≈ 1600 B/s; silk frames ≈ 28 B / 20ms
-                        int duration = ext == ".amr" ? Math.Max(1, bytes.Length / 1600) : ext == ".silk" ? Math.Max(1, bytes.Length / 1400) : 1;
+                        // 语音三态（QQ 语音全链路 silk；AMR 新客户端已不解码）：
+                        //   silk → 原样发 formatType=1；amr → 透传 formatType=2（兼容旧端）；
+                        //   其余（mp3/wav/m4a…）→ ffmpeg 24kHz 单声道 PCM → silk_v3_encoder -tencent（QQ 兼容流）→ formatType=1
+                        var src = await MaterializeFileAsync(S("file"), null, "record", "silk");
+                        if (src is null) throw new Ob11BadException("record file not resolvable: " + S("file"));
+                        var recExt = Path.GetExtension(src).ToLowerInvariant();
+                        string voicePath;
+                        int formatType;
+                        long durationSec;
+                        if (recExt == ".silk")
+                        {
+                            voicePath = src; formatType = 1;
+                            durationSec = Math.Max(1, new FileInfo(src).Length / 1400); // silk ≈ 28B/20ms 上限估
+                        }
+                        else if (recExt == ".amr")
+                        {
+                            voicePath = src; formatType = 2;
+                            durationSec = Math.Max(1, new FileInfo(src).Length / 1600); // AMR 12.2kbps ≈ 1600B/s
+                        }
+                        else
+                        {
+                            var encoded = await TryEncodeSilkAsync(src, silkEncoderPath);
+                            if (encoded is null)
+                                throw new Ob11UnsupportedException(
+                                    "record: cannot encode to silk (need ffmpeg + silk_v3_encoder, or input already silk/amr): " + recExt);
+                            voicePath = encoded.Value.Path; formatType = 1; durationSec = encoded.Value.DurationSec;
+                        }
+                        var vBytes = await File.ReadAllBytesAsync(voicePath);
+                        var vMd5 = Convert.ToHexString(MD5.HashData(vBytes)).ToLowerInvariant();
+                        var vName = "voice_" + vMd5[..12] + (formatType == 1 ? ".silk" : ".amr");
+                        var vStaged = await KernelAsync(registry, hub, "msg.prepareMedia", new
+                        {
+                            srcPath = voicePath,
+                            fileName = vName,
+                            elementType = 4,
+                            md5HexStr = vMd5,
+                        });
                         elements.Add(new Dictionary<string, object?>
                         {
                             ["elementType"] = 4,
                             ["elementId"] = "",
                             ["pttElement"] = new Dictionary<string, object?>
                             {
-                                ["fileName"] = ptt.Value.fileName,
-                                ["filePath"] = ptt.Value.path,
-                                ["md5HexStr"] = ptt.Value.md5,
-                                ["fileSize"] = ptt.Value.fileSize.ToString(),
-                                ["duration"] = duration,
-                                ["formatType"] = ext == ".amr" ? 2 : 1,
+                                ["fileName"] = Str2(vStaged, "fileName") ?? vName,
+                                ["filePath"] = Str2(vStaged, "path") ?? voicePath,
+                                ["md5HexStr"] = vMd5,
+                                ["fileSize"] = vBytes.Length.ToString(),
+                                ["duration"] = durationSec,
+                                ["formatType"] = formatType,
                                 ["voiceType"] = 1,
                                 ["voiceChangeType"] = 0,
                                 ["canConvert2Text"] = true,
@@ -964,6 +995,56 @@ public static class Ob11Mapper
         }
         catch { }
         return null;
+    }
+
+    /// <summary>ffmpeg → 24kHz 单声道 PCM → silk_v3_encoder -tencent（QQ/微信兼容流：0x02 头 + 无帧长前缀）。
+    /// 返回 silk 路径与精确时长（PCM 字节换算）；任一步失败返回 null。</summary>
+    private static async Task<(string Path, long DurationSec)?> TryEncodeSilkAsync(string src, string encoderPath)
+    {
+        var ffmpeg = FindFfmpeg();
+        if (ffmpeg is null || !File.Exists(src) || !File.Exists(encoderPath)) return null;
+        var dir = Path.Combine(Path.GetTempPath(), "aar");
+        Directory.CreateDirectory(dir);
+        var pcm = Path.Combine(dir, "voice-" + Guid.NewGuid().ToString("N") + ".pcm");
+        var silk = Path.Combine(dir, "voice-" + Guid.NewGuid().ToString("N") + ".silk");
+        try
+        {
+            if (!await RunToolAsync(ffmpeg, "-y -v error -i \"" + src + "\" -f s16le -ar 24000 -ac 1 \"" + pcm + "\"", 60_000)) return null;
+            var pcmLen = new FileInfo(pcm).Length;
+            if (pcmLen < 4800) return null; // <0.1s 视为无效音频
+            if (!await RunToolAsync(encoderPath, "\"" + pcm + "\" \"" + silk + "\" -tencent -quiet", 60_000)) return null;
+            if (new FileInfo(silk).Length < 10) return null;
+            File.Delete(pcm);
+            return (silk, Math.Max(1, pcmLen / 48000)); // 24000Hz × 2 字节 = 48000 B/s
+        }
+        catch { return null; }
+        finally { try { if (File.Exists(pcm)) File.Delete(pcm); } catch { } }
+    }
+
+    /// <summary>外部工具受控执行（超时即杀）；exit 0 视为成功。</summary>
+    private static async Task<bool> RunToolAsync(string exe, string args, int timeoutMs)
+    {
+        try
+        {
+            using var proc = new System.Diagnostics.Process();
+            proc.StartInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = exe,
+                Arguments = args,
+                UseShellExecute = false,
+                RedirectStandardError = true,
+            };
+            proc.Start();
+            var wait = proc.WaitForExitAsync();
+            var done = await Task.WhenAny(wait, Task.Delay(timeoutMs));
+            if (done != wait)
+            {
+                try { proc.Kill(true); } catch { }
+                return false;
+            }
+            return wait.IsCompletedSuccessfully && proc.ExitCode == 0;
+        }
+        catch { return false; }
     }
 
     /// <summary>收集 message（string/array/单个对象）里所有 reply 段的 id（供持久层回查）。</summary>

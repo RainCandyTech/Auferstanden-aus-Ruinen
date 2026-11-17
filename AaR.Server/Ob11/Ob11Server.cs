@@ -1250,7 +1250,8 @@ public class Ob11Server
                     }
                     var elements = await Ob11Mapper.SegmentsToElementsAsync(
                         message, _bridge, _hub, _msgIndex, chatType, uid,
-                        async uin => (await CallKernel("uin.toUid", new { uin })).TryGetProperty("uid", out var u) ? u.GetString() : null);
+                        async uin => (await CallKernel("uin.toUid", new { uin })).TryGetProperty("uid", out var u) ? u.GetString() : null,
+                        _opts.SilkEncoderPath);
                     var autoEscape = Ob11.Bool(j, "auto_escape");
                     if (autoEscape)
                         elements = new List<Dictionary<string, object?>> { Ob11Mapper.TextEl(BuildRawText(j)) };

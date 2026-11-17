@@ -19,8 +19,10 @@ public static class Ob11Mapper
     public static async Task<List<Dictionary<string, object?>>> SegmentsToElementsAsync(
         JsonElement message, BridgeRegistry registry, IHubContext<AaRHub> hub,
         IReadOnlyDictionary<string, string> msgIdToPeer, int chatType, string peerUidForReply,
-        Func<string, Task<string?>> resolveUidAsync, string silkEncoderPath = "/opt/aar/bin/silk_v3_encoder")
+        Func<string, Task<string?>> resolveUidAsync, string? silkEncoderPath = null)
     {
+        // 发行包内置 bin/silk_v3_encoder（随服务端目录解析）；显式传参可覆盖
+        silkEncoderPath ??= System.IO.Path.Combine(System.AppContext.BaseDirectory, "bin", "silk_v3_encoder");
         var elements = new List<Dictionary<string, object?>>();
         var segments = NormalizeSegments(message);
 

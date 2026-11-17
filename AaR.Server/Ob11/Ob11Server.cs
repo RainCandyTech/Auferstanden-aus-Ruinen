@@ -1163,9 +1163,9 @@ public class Ob11Server
         return doc.RootElement.Clone();
     }
 
-    private async Task<JsonElement> CallKernel(string method, object? rpcParams)
+    private async Task<JsonElement> CallKernel(string method, object? rpcParams, int? timeoutMs = null)
     {
-        var (ok, dataOpt, err) = await _bridge.CallJsonAsync(_hub, method, rpcParams);
+        var (ok, dataOpt, err) = await _bridge.CallJsonAsync(_hub, method, rpcParams, timeoutMs);
         if (!ok) throw new Ob11BadException($"kernel call {method} failed: {err}");
         return dataOpt ?? JsonSerializer.SerializeToElement(new object());
     }
@@ -1254,7 +1254,9 @@ public class Ob11Server
                     var autoEscape = Ob11.Bool(j, "auto_escape");
                     if (autoEscape)
                         elements = new List<Dictionary<string, object?>> { Ob11Mapper.TextEl(BuildRawText(j)) };
-                    var ret = await CallKernel("msg.send", new { chatType, peerUid = uid, elements });
+                    // 群文件上传走 highway 云通道，耗时可达分钟级——file 元素单独放宽 RPC 超时
+                    var hasFile = elements.Any(e => e.TryGetValue("elementType", out var et) && et is int i3 && i3 == 3);
+                    var ret = await CallKernel("msg.send", new { chatType, peerUid = uid, elements }, hasFile ? 180_000 : null);
                     var delivered = ret.TryGetProperty("delivered", out var dv) && dv.ValueKind == JsonValueKind.True;
                     // the generated uniqueId marker differs from the real msgId QQ assigns
                     // (real = marker + 1 in practice); we tracked the real id via the

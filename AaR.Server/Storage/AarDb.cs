@@ -78,8 +78,9 @@ public class AarDbContext : DbContext
         mb.Entity<StoredMessage>(e =>
         {
             e.HasKey(x => x.MessageId);
-            // reply 引用按 (chatType, peerUid, seq) 反查 message_id
-            e.HasIndex(x => new { x.ChatType, x.PeerUid, x.Seq }).IsUnique();
+            // seq 是回查辅助键：私聊 clientSeq 可重复（NT 语义），转发容器占位 seq="0"，
+            // 故只能普通索引——唯一性由 MessageId 主键承担
+            e.HasIndex(x => new { x.ChatType, x.PeerUid, x.Seq });
         });
         mb.Entity<StoredMedia>(e =>
         {

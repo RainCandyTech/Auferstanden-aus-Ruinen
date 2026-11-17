@@ -16,13 +16,14 @@ public class Ob11Server
     private readonly AaROptions _opts;
     private readonly ILogger<Ob11Server> _logger;
     private readonly IHubContext<AaRHub> _hub;
+    private readonly Storage.Ob11Store _store;
 
     public volatile string SelfUid = "";
     public volatile string SelfUin = "";
     public volatile string SelfNick = "";
 
     /// <summary>Server version reported by get_version_info and the #AaR debug command.</summary>
-    public const string ServerVersion = "0.4.1";
+    public const string ServerVersion = "0.5.0";
 
     // msgId -> "chatType|peerUid|seq" for delete_msg / get_msg / reply building
     private readonly ConcurrentDictionary<string, string> _msgIndex = new();
@@ -72,16 +73,18 @@ public class Ob11Server
             sd.TryGetValue("user_id", out var suid) && suid is not null && suid.GetType() != typeof(string))
             sd["user_id"] = suid.ToString();
     }
-    // connected OB11 WS clients (forward ws)
+    // connected OB11 WS clients (forward ws) + per-client mode (standard /api /event / universal)
     private readonly ConcurrentDictionary<string, System.Net.WebSockets.WebSocket> _wsClients = new();
+    private readonly ConcurrentDictionary<string, WsClientMode> _wsModes = new();
     private DateTime _startedAt = DateTime.UtcNow;
 
-    public Ob11Server(BridgeRegistry bridge, AaROptions opts, ILogger<Ob11Server> logger, IHubContext<AaRHub> hub)
+    public Ob11Server(BridgeRegistry bridge, AaROptions opts, ILogger<Ob11Server> logger, IHubContext<AaRHub> hub, Storage.Ob11Store store)
     {
         _bridge = bridge;
         _opts = opts;
         _logger = logger;
         _hub = hub;
+        _store = store;
         _bridge.BridgeChanged += () =>
         {
             if (_bridge.IsBridgeConnected)
@@ -96,15 +99,20 @@ public class Ob11Server
         _ = Task.Run(() => HeartbeatLoopAsync(_shutdownCts.Token));
     }
 
-    public void RegisterWsClient(string id, System.Net.WebSockets.WebSocket ws)
+    /// <summary>Forward-WS client capability: 标准 /api /event 分路与 universal 全能。</summary>
+    public enum WsClientMode { Universal, Api, Event }
+
+    public void RegisterWsClient(string id, System.Net.WebSockets.WebSocket ws, WsClientMode mode = WsClientMode.Universal)
     {
         _wsClients[id] = ws;
+        _wsModes[id] = mode;
         _wsSendLocks.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
     }
 
     public void RemoveWsClient(string id)
     {
         _wsClients.TryRemove(id, out _);
+        _wsModes.TryRemove(id, out _);
         if (_wsSendLocks.TryRemove(id, out var l)) l.Dispose();
     }
 
@@ -238,15 +246,15 @@ public class Ob11Server
 
             var msgId = Ob11.Str(rec, "msgId") ?? "";
             var peerUid = Ob11.Str(rec, "peerUid") ?? "";
-            var seq = Ob11.Str(rec, "msgSeq") ?? "0";
-            RememberMsgId(msgId, $"{chatType}|{peerUid}|{seq}");
-            RememberSeq(chatType.ToString(), peerUid, seq, msgId);
 
             var isGroup = chatType == 2;
             var senderUid = Ob11.Str(rec, "senderUid") ?? "";
             var senderUin = Ob11.Str(rec, "senderUin") ?? "";
+            RememberMessage(rec, msgId, chatType, peerUid, isSelfSent: senderUid == SelfUid);
+            RememberSeq(chatType.ToString(), peerUid, Ob11.Str(rec, "msgSeq") ?? "0", msgId);
             LearnUin(senderUid, senderUin);
             if (string.IsNullOrEmpty(senderUin)) senderUin = await ResolveUinCachedAsync(senderUid);
+            if (isGroup) _ = EnsureMemberListAsync(peerUid); // one-shot role/card/level preheat
 
             var segments = await Ob11Mapper.ElementsToSegmentsAsync(
                 rec.TryGetProperty("elements", out var els) ? els : default,
@@ -255,6 +263,17 @@ public class Ob11Server
 
             IndexMedia(rec, msgId, chatType, peerUid);
             IndexReplyTargets(segments, chatType, peerUid);
+            IndexForwardSegments(segments, msgId, chatType, peerUid);
+
+            var senderRole = "member";
+            var senderLevel = "";
+            var senderCard = isGroup ? (Ob11.Str(rec, "sendMemberName") ?? "") : "";
+            if (isGroup && _memberCache.TryGetValue($"{peerUid}|{senderUin}", out var mc))
+            {
+                senderRole = mc.Role;
+                senderLevel = mc.Level;
+                if (senderCard.Length == 0) senderCard = mc.Card;
+            }
 
             // #AaR in-chat debug command: fire-and-forget so a slow kernel send
             // never delays event mapping; self-sent records are skipped to
@@ -278,12 +297,13 @@ public class Ob11Server
                 {
                     ["user_id"] = senderUin,
                     ["nickname"] = Ob11.Str(rec, "sendNickName") ?? "",
-                    ["card"] = isGroup ? (Ob11.Str(rec, "sendMemberName") ?? "") : "",
+                    ["card"] = senderCard,
                     ["sex"] = "unknown",
                     ["age"] = 0,
-                    ["role"] = "member",
+                    ["role"] = senderRole,
                 },
             };
+            if (senderLevel.Length > 0) ((Dictionary<string, object?>)evt["sender"]!)["level"] = senderLevel;
             if (isGroup) evt["group_id"] = peerUid;
             // group file upload notice (OneBot v11 notice_type=group_upload)
             if (isGroup && segments.Any(s => s.TryGetValue("type", out var t) && t?.ToString() == "file"))
@@ -345,6 +365,12 @@ public class Ob11Server
             _mediaIndex[m.Key] = m;
             _mediaIndexOrder.Enqueue(m.Key); // duplicates OK: trim dedups via TryRemove
             TrimMediaIndex();
+            _ = _store.SaveMediaAsync(new Storage.StoredMedia
+            {
+                Key = m.Key, Kind = m.Kind, ElementId = m.ElementId, MsgId = m.MsgId,
+                ChatType = m.ChatType, PeerUid = m.PeerUid,
+                LocalPath = m.LocalPath, Url = m.Url, Name = m.Name, Size = m.Size,
+            });
         }
     }
 
@@ -362,6 +388,116 @@ public class Ob11Server
         _msgIndex[msgId] = idx;
         _msgIndexOrder.Enqueue(msgId);
         TrimIndex();
+    }
+
+    /// <summary>媒体索引回查：内存 L1 miss → SQLite L2（命中回填 L1）。</summary>
+    private async Task<Ob11Mapper.MediaRef?> FindMediaAsync(string key)
+    {
+        var m = await _store.GetMediaAsync(key.ToLowerInvariant());
+        if (m is null) return null;
+        var r = new Ob11Mapper.MediaRef(m.Kind, m.Key, m.ElementId, m.MsgId, m.ChatType, m.PeerUid,
+            m.LocalPath, m.Url, m.Name, m.Size);
+        _mediaIndex[r.Key] = r;
+        _mediaIndexOrder.Enqueue(r.Key);
+        return r;
+    }
+
+    /// <summary>Record-level indexing: memory L1 + SQLite L2 (fire-and-forget persistence).</summary>
+    private void RememberMessage(JsonElement rec, string msgId, long chatType, string peerUid, bool isSelfSent)
+    {
+        if (msgId.Length == 0) return;
+        var seq = Ob11.Str(rec, "msgSeq") ?? "0";
+        RememberMsgId(msgId, $"{chatType}|{peerUid}|{seq}");
+        RememberSeq(chatType.ToString(), peerUid, seq, msgId);
+        _ = _store.SaveMessageAsync(new Storage.StoredMessage
+        {
+            MessageId = msgId,
+            ChatType = chatType,
+            PeerUid = peerUid,
+            Seq = seq,
+            SenderUid = Ob11.Str(rec, "senderUid") ?? "",
+            SenderUin = Ob11.Str(rec, "senderUin") ?? "",
+            MsgTime = Ob11.Long(rec, "msgTime"),
+            IsSelfSent = isSelfSent,
+        });
+    }
+
+    /// <summary>msgId → "chatType|peerUid|seq": L1 memory first, then the SQLite store.</summary>
+    private async Task<string?> FindIndexAsync(string msgId)
+    {
+        if (_msgIndex.TryGetValue(msgId, out var idx)) return idx;
+        var m = await _store.GetMessageAsync(msgId);
+        if (m is null) return null;
+        idx = $"{m.ChatType}|{m.PeerUid}|{m.Seq}";
+        RememberMsgId(msgId, idx);
+        return idx;
+    }
+
+    /// <summary>Index merged-forward containers: real msgId ↔ resId (forward 段 id), memory + store.</summary>
+    private void IndexForwardSegments(List<Dictionary<string, object?>> segments, string msgId, long chatType, string peerUid)
+    {
+        foreach (var s in segments)
+        {
+            if (!s.TryGetValue("type", out var t) || t?.ToString() != "forward") continue;
+            if (!s.TryGetValue("data", out var d) || d is not Dictionary<string, object?> dd) continue;
+            var resId = dd.TryGetValue("id", out var i) ? i?.ToString() ?? "" : "";
+            if (resId.Length == 0 || resId == msgId) continue;
+            RememberMsgId(resId, $"{chatType}|{peerUid}|0");
+            _ = _store.SaveForwardAsync(new Storage.StoredForward
+            {
+                MessageId = msgId, ResId = resId, ChatType = chatType, PeerUid = peerUid,
+            });
+        }
+    }
+
+    /// <summary>Wait briefly for the listUpdate to teach us the real msgId behind a send marker.</summary>
+    private async Task<string?> WaitForRealMsgIdAsync(string marker)
+    {
+        if (_markerToRealId.TryGetValue(marker, out var rid)) return rid;
+        var stored = await _store.GetMarkerAsync(marker);
+        if (stored is not null) return stored;
+        for (int i = 0; i < 20; i++) // ~3s cap; the kernel normally reports within a few hundred ms
+        {
+            await Task.Delay(150);
+            if (_markerToRealId.TryGetValue(marker, out rid)) return rid;
+        }
+        return await _store.GetMarkerAsync(marker) ?? marker;
+    }
+
+    // ---------- member cache (role/level/card) ----------
+
+    private readonly ConcurrentDictionary<string, (string Role, string Level, string Card, long Tick)> _memberCache = new();
+    private readonly HashSet<string> _memberListFetched = new();
+    private readonly object _memberFetchLock = new();
+
+    private void LearnMember(string gid, string? uin, string? role, string? level, string? card)
+    {
+        if (string.IsNullOrEmpty(uin)) return;
+        _memberCache[$"{gid}|{uin}"] = (RoleToString(role), level ?? "", card ?? "",
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        TrimMemberCache();
+    }
+
+    private void TrimMemberCache()
+    {
+        if (_memberCache.Count <= 8000) return;
+        var cutoff = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - 3600_000;
+        foreach (var kv in _memberCache)
+            if (kv.Value.Tick < cutoff) _memberCache.TryRemove(kv.Key, out _);
+    }
+
+    /// <summary>One-shot per-group member list fetch (NapCat-style preheat) to fill role/card/level.</summary>
+    private async Task EnsureMemberListAsync(string gid)
+    {
+        lock (_memberFetchLock)
+        {
+            if (!_memberListFetched.Add(gid)) return;
+        }
+        try
+        {
+            await DispatchAsync("get_group_member_list", new Dictionary<string, object?> { ["group_id"] = gid });
+        }
+        catch (Exception ex) { _logger.LogDebug(ex, "member list preheat failed for {Gid}", gid); }
     }
 
     private async Task HandleMsgListUpdateAsync(JsonElement root)
@@ -427,9 +563,7 @@ public class Ob11Server
             {
                 var msgId = Ob11.Str(rec, "msgId") ?? "";
                 var peerUid = Ob11.Str(rec, "peerUid") ?? "";
-                var seq = Ob11.Str(rec, "msgSeq") ?? "0";
-                RememberMsgId(msgId, $"{chatType}|{peerUid}|{seq}");
-                RememberSeq(chatType.ToString(), peerUid, seq, msgId);
+                RememberMessage(rec, msgId, chatType, peerUid, isSelfSent: true);
                 // guildId on self-sent records is our generated send marker -> map to real id
                 var marker = Ob11.Str(rec, "guildId") ?? "";
                 if (!string.IsNullOrEmpty(marker) && marker.StartsWith("7") && marker != msgId)
@@ -437,6 +571,7 @@ public class Ob11Server
                     _markerToRealId[marker] = msgId;
                     _markerOrder.Enqueue(marker);
                     TrimMarkerIndex();
+                    _ = _store.SaveMarkerAsync(marker, msgId);
                 }
 
                 var isGroup = chatType == 2;
@@ -452,6 +587,15 @@ public class Ob11Server
 
                 IndexMedia(rec, msgId, chatType, peerUid);
                 IndexReplyTargets(segments, chatType, peerUid);
+                IndexForwardSegments(segments, msgId, chatType, peerUid);
+
+                var selfRole = "member";
+                var selfLevel = "";
+                var selfCard = "";
+                if (isGroup && _memberCache.TryGetValue($"{peerUid}|{senderUin}", out var smc))
+                {
+                    selfRole = smc.Role; selfLevel = smc.Level; selfCard = smc.Card;
+                }
 
                 var evt = new Dictionary<string, object?>
                 {
@@ -469,12 +613,13 @@ public class Ob11Server
                     {
                         ["user_id"] = SelfUin,
                         ["nickname"] = SelfNick,
-                        ["card"] = "",
+                        ["card"] = selfCard,
                         ["sex"] = "unknown",
                         ["age"] = 0,
-                        ["role"] = "member",
+                        ["role"] = selfRole,
                     },
                 };
+                if (selfLevel.Length > 0) ((Dictionary<string, object?>)evt["sender"]!)["level"] = selfLevel;
                 if (isGroup) evt["group_id"] = peerUid;
                 await BroadcastAsync(evt);
             }
@@ -573,16 +718,18 @@ public class Ob11Server
                     {
                         var admin = su.TryGetProperty("admin", out var ad) ? ad : default;
                         var member = su.TryGetProperty("member", out var me) ? me : default;
+                        var duration = Ob11.Long(su, "duration");
                         await BroadcastAsync(new Dictionary<string, object?>
                         {
                             ["time"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
                             ["self_id"] = SelfUin,
                             ["post_type"] = "notice",
                             ["notice_type"] = "group_ban",
+                            ["sub_type"] = duration > 0 ? "ban" : "lift_ban",
                             ["group_id"] = Ob11.Str(rec, "peerUid") ?? "",
                             ["operator_id"] = LookupUin(admin.TryGetProperty("uid", out var adu) ? adu.GetString() ?? "" : ""),
                             ["user_id"] = LookupUin(member.TryGetProperty("uid", out var meu) ? meu.GetString() ?? "" : ""),
-                            ["duration"] = su.TryGetProperty("duration", out var du) && long.TryParse(du.GetString(), out var d2) ? d2 : 0,
+                            ["duration"] = duration,
                         });
                     }
                 }
@@ -698,11 +845,12 @@ public class Ob11Server
             TrimDebugCmdPeers(nowMs);
 
             // full, unmasked diagnostics -> server log (operator eyes only)
+            var fullInfo = await BuildFullDebugInfoAsync();
             _logger.LogInformation(
                 "#AaR debug command in {ChatType}: peer={PeerUid} senderUid={SenderUid} senderUin={SenderUin} msgId={MsgId}{NewLine}{FullInfo}",
                 chatType == 2 ? "group" : "private",
                 peerUid, senderUid, senderUin, msgId,
-                Environment.NewLine, BuildFullDebugInfo());
+                Environment.NewLine, fullInfo);
 
             // sanitized summary -> chat reply via the kernel
             var reply = BuildSanitizedDebugInfo(chatType);
@@ -715,26 +863,55 @@ public class Ob11Server
         }
     }
 
-    /// <summary>Sanitized status summary for the chat reply (no uins/uids/urls/tokens).</summary>
+    /// <summary>QQ NT version from package.json (e.g. 3.2.35-54395); cached, "" when unreadable.</summary>
+    private volatile string _qqVersion = "";
+    private string ResolveQQVersion()
+    {
+        if (_qqVersion.Length > 0) return _qqVersion;
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(_opts.QQVersionJsonPath));
+            _qqVersion = doc.RootElement.TryGetProperty("version", out var v) ? v.GetString() ?? "" : "";
+        }
+        catch { }
+        return _qqVersion;
+    }
+
+    private static string PlatformString()
+    {
+        var arch = System.Runtime.InteropServices.RuntimeInformation.OSArchitecture switch
+        {
+            System.Runtime.InteropServices.Architecture.X64 => "X86-64",
+            System.Runtime.InteropServices.Architecture.X86 => "X86",
+            System.Runtime.InteropServices.Architecture.Arm64 => "ARM64",
+            System.Runtime.InteropServices.Architecture.Arm => "ARM",
+            _ => System.Runtime.InteropServices.RuntimeInformation.OSArchitecture.ToString(),
+        };
+        return "Linux " + arch;
+    }
+
+    /// <summary>Uptime as 3小时12分钟 (or 12分钟 under one hour).</summary>
+    private static string UptimeHoursMinutes(TimeSpan t) =>
+        (int)t.TotalHours > 0 ? $"{(int)t.TotalHours}小时{t.Minutes}分钟" : $"{t.Minutes}分钟";
+
+    /// <summary>
+    /// Sanitized banner for the chat reply (no uins/uids/urls/tokens). Fixed
+    /// six-line format; full diagnostics go to the server log only.
+    /// </summary>
     private string BuildSanitizedDebugInfo(long chatType)
     {
-        var uptime = FormatUptime(DateTime.UtcNow - _startedAt);
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine("AaR 运行状态（脱敏摘要，完整信息仅写入服务端日志）");
-        sb.AppendLine($"版本: AaR {ServerVersion}");
-        sb.AppendLine($"运行时长: {uptime}");
-        sb.AppendLine($"桥接内核: {(_bridge.IsBridgeConnected ? "已连接" : "未连接")}");
-        sb.AppendLine($"事件: 收 {EventsReceived} / 发 {EventsBroadcast}");
-        sb.AppendLine($"WS 客户端: {_wsClients.Count}");
-        sb.AppendLine($"会话索引: 消息 {_msgIndex.Count} / 媒体 {_mediaIndex.Count} / uid 缓存 {_uidToUin.Count}");
-        sb.AppendLine($"鉴权令牌: {(string.IsNullOrEmpty(_opts.AccessToken) ? "未配置" : "已配置")}");
-        sb.AppendLine($"本机 QQ: {MaskId(SelfUin)}");
-        sb.AppendLine($"来源: {(chatType == 2 ? "群聊" : "私聊")}");
-        return sb.ToString().TrimEnd();
+        sb.AppendLine($"项目代号\"{_opts.ProjectCodename}\"，{_opts.DeploymentLabel}");
+        sb.AppendLine($"版本{ServerVersion}");
+        sb.AppendLine($"平台{PlatformString()}");
+        sb.AppendLine($"运行时间{UptimeHoursMinutes(DateTime.UtcNow - _startedAt)}");
+        sb.AppendLine($".NET{Environment.Version}/QQ {ResolveQQVersion()}");
+        sb.Append("SignalR-JSRPC模式");
+        return sb.ToString();
     }
 
     /// <summary>Full diagnostics for the server log.</summary>
-    private string BuildFullDebugInfo()
+    private async Task<string> BuildFullDebugInfoAsync()
     {
         var sb = new System.Text.StringBuilder();
         string ReverseTokenCount<T>(List<T>? list, Func<T, string?> token) =>
@@ -762,6 +939,8 @@ public class Ob11Server
             sb.AppendLine($"events      : received={EventsReceived} broadcast={EventsBroadcast}");
             sb.AppendLine($"ob11-ws     : clients={_wsClients.Count}");
             sb.AppendLine($"indexes     : msg={_msgIndex.Count}/5000 seq={_seqIndex.Count}/5000 media={_mediaIndex.Count}/3000 uidCache={_uidToUin.Count} markers={_markerToRealId.Count}/2000");
+            var (sm, sd, su) = await _store.StatsAsync();
+            sb.AppendLine($"storage     : provider={_opts.Storage.Provider} messages={sm} media={sd} uidmap={su}");
             sb.AppendLine($"debug-cmd   : cooldown peers tracked={_debugCmdPeerTick.Count}");
         }
         catch (Exception ex)
@@ -788,7 +967,7 @@ public class Ob11Server
                 var id = S2("id");
                 if (string.IsNullOrEmpty(id))
                     throw new Ob11UnsupportedException("custom-content forward nodes are not supported (reference existing message ids)");
-                if (!_msgIndex.TryGetValue(id, out var nidx))
+                if (await FindIndexAsync(id) is not { } nidx)
                     throw new Ob11BadException("forward node references unknown message_id: " + id);
                 var np = nidx.Split('|');
                 if (int.Parse(np[0]) != chatType || np[1] != peerUid)
@@ -818,8 +997,7 @@ public class Ob11Server
                 var senderUin = Ob11.Str(rec, "senderUin") ?? await ResolveUinCachedAsync(Ob11.Str(rec, "senderUid") ?? "");
                 LearnUin(Ob11.Str(rec, "senderUid"), senderUin);
                 var chatType = Ob11.Long(rec, "chatType");
-                RememberMsgId(mid, $"{chatType}|{Ob11.Str(rec, "peerUid") ?? peerId}|{Ob11.Str(rec, "msgSeq") ?? "0"}");
-                RememberSeq(chatType.ToString(), Ob11.Str(rec, "peerUid") ?? peerId, Ob11.Str(rec, "msgSeq") ?? "0", mid);
+                RememberMessage(rec, mid, chatType, Ob11.Str(rec, "peerUid") ?? peerId, isSelfSent: senderUin == SelfUin);
                 IndexMedia(rec, mid, chatType, Ob11.Str(rec, "peerUid") ?? peerId);
                 IndexReplyTargets(segs, chatType, Ob11.Str(rec, "peerUid") ?? peerId);
                 var item = new Dictionary<string, object?>
@@ -875,22 +1053,26 @@ public class Ob11Server
         return string.IsNullOrEmpty(uin) ? null : uin;
     }
 
-    /// <summary>Cache-backed async resolve used by event handlers.</summary>
+    /// <summary>Cache-backed async resolve used by event handlers: memory → store → kernel.</summary>
     private async Task<string> ResolveUinCachedAsync(string uid)
     {
         if (string.IsNullOrEmpty(uid)) return "";
         if (!uid.StartsWith('u')) return uid;
         if (_uidToUin.TryGetValue(uid, out var v) && !string.IsNullOrEmpty(v)) return v;
+        var stored = await _store.GetUinAsync(uid);
+        if (!string.IsNullOrEmpty(stored)) { _uidToUin[uid] = stored; return stored; }
         try { return await ResolveUinAsync(uid); }
         catch { return ""; }
     }
 
-    /// <summary>Learn a uid->uin pair from any record or list entry.</summary>
+    /// <summary>Learn a uid->uin pair from any record or list entry (memory + persistent store).</summary>
     private void LearnUin(string? uid, string? uin)
     {
         if (string.IsNullOrEmpty(uid) || !uid.StartsWith('u')) return;
         if (string.IsNullOrEmpty(uin) || !uin.All(char.IsDigit)) return;
+        var changed = !_uidToUin.TryGetValue(uid, out var prev) || prev != uin;
         _uidToUin[uid] = uin;
+        if (changed) _ = _store.LearnUinAsync(uid, uin);
     }
 
     private void TrimIndex()
@@ -923,28 +1105,54 @@ public class Ob11Server
     }
 
     public async Task<Ob11Response> HandleActionAsync(string action, Dictionary<string, object?> p, string? echo)
+        => await HandleActionAsync(action, p, echo, echoRaw: null);
+
+    public async Task<Ob11Response> HandleActionAsync(string action, Dictionary<string, object?> p, string? echo, JsonElement? echoRaw)
     {
+        // 标准：所有 API 都支持 _async / _rate_limited 后缀——后台执行，立即返回 async
+        if (action.EndsWith("_async", StringComparison.Ordinal) || action.EndsWith("_rate_limited", StringComparison.Ordinal))
+        {
+            var stripped = action.EndsWith("_async", StringComparison.Ordinal) ? action[..^6] : action[..^13];
+            _ = Task.Run(async () =>
+            {
+                try { await DispatchAsync(stripped, p); }
+                catch (Exception ex) { _logger.LogWarning(ex, "async action {Action} failed", stripped); }
+            });
+            return Ob11Response.Async(echo, echoRaw);
+        }
         try
         {
             var data = await DispatchAsync(action, p);
-            return Ob11Response.Ok(data, echo);
+            return Ob11Response.Ok(data, echo, echoRaw);
+        }
+        catch (Ob11AsyncSignal)
+        {
+            return Ob11Response.Async(echo, echoRaw);
+        }
+        catch (Ob11UnknownActionException ex)
+        {
+            return Ob11Response.Fail(1404, ex.Message, echo: echo, echoRaw: echoRaw);
         }
         catch (Ob11UnsupportedException ex)
         {
-            return Ob11Response.Fail(Ob11.RetUnsupported, ex.Message, echo: echo);
+            return Ob11Response.Fail(Ob11.RetUnsupported, ex.Message, echo: echo, echoRaw: echoRaw);
         }
         catch (Ob11ParamException ex)
         {
-            return Ob11Response.Fail(Ob11.RetParamMissing, ex.Message, echo: echo);
+            return Ob11Response.Fail(Ob11.RetParamMissing, ex.Message, echo: echo, echoRaw: echoRaw);
+        }
+        catch (Ob11EmptyException ex)
+        {
+            return Ob11Response.Fail(Ob11.RetParamEmpty, ex.Message, echo: echo, echoRaw: echoRaw);
         }
         catch (Ob11BadException ex)
         {
-            return Ob11Response.Fail(Ob11.RetParamBad, ex.Message, echo: echo);
+            return Ob11Response.Fail(Ob11.RetParamBad, ex.Message, echo: echo, echoRaw: echoRaw);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "action {Action} failed", action);
-            return Ob11Response.Fail(-1, ex.Message, echo: echo);
+            return Ob11Response.Fail(-1, ex.Message, echo: echo, echoRaw: echoRaw);
         }
     }
 
@@ -1034,6 +1242,12 @@ public class Ob11Server
                     if (chatType == 1 && !peerUid.StartsWith('u'))
                         uid = await ResolveUidAsync(peerUid);
                     var message = Ob11.Get(j, "message");
+                    // reply 引用持久化回查：内存 L1 miss 的 reply id 先查 SQLite（重启后回复链不丢）
+                    foreach (var rid in Ob11Mapper.CollectReplyIds(message).Where(id => !_msgIndex.ContainsKey(id)))
+                    {
+                        var sm = await _store.GetMessageAsync(rid);
+                        if (sm is not null) RememberMsgId(rid, $"{sm.ChatType}|{sm.PeerUid}|{sm.Seq}");
+                    }
                     var elements = await Ob11Mapper.SegmentsToElementsAsync(
                         message, _bridge, _hub, _msgIndex, chatType, uid,
                         async uin => (await CallKernel("uin.toUid", new { uin })).TryGetProperty("uid", out var u) ? u.GetString() : null);
@@ -1046,10 +1260,12 @@ public class Ob11Server
                     // (real = marker + 1 in practice); we tracked the real id via the
                     // onMsgInfoListUpdate record — look it up by marker in the msg index.
                     var marker = ret.TryGetProperty("msgId", out var mi) ? mi.GetString() : null;
-                    var realMsgId = (_markerToRealId.TryGetValue(marker ?? "", out var rid)) ? rid : marker;
+                    // the generated uniqueId marker differs from the real msgId QQ assigns —
+                    // wait briefly for onMsgInfoListUpdate (memory) or the store to teach us
+                    var realMsgId = marker is not null ? await WaitForRealMsgIdAsync(marker) : null;
                     return ToElement(new Dictionary<string, object?>
                     {
-                        ["message_id"] = realMsgId,
+                        ["message_id"] = realMsgId ?? marker ?? "",
                         ["res_id"] = "",
                         ["delivered"] = delivered,
                         // kernel-side verdict for diagnostics (result 0 = ok)
@@ -1061,8 +1277,8 @@ public class Ob11Server
             case "delete_msg":
                 {
                     var msgId = Ob11.Str(j, "message_id") ?? throw new Ob11ParamException("message_id");
-                    if (!_msgIndex.TryGetValue(msgId, out var idx))
-                        throw new Ob11BadException("unknown message_id (not seen in this session): " + msgId);
+                    var idx = await FindIndexAsync(msgId)
+                        ?? throw new Ob11BadException("unknown message_id (not seen in this session or store): " + msgId);
                     var parts = idx.Split('|');
                     var ret = await CallKernel("msg.recall", new
                     {
@@ -1076,8 +1292,8 @@ public class Ob11Server
             case "get_msg":
                 {
                     var msgId = Ob11.Str(j, "message_id") ?? throw new Ob11ParamException("message_id");
-                    if (!_msgIndex.TryGetValue(msgId, out var idx))
-                        throw new Ob11BadException("unknown message_id: " + msgId);
+                    var idx = await FindIndexAsync(msgId)
+                        ?? throw new Ob11BadException("unknown message_id: " + msgId);
                     var parts = idx.Split('|');
                     var ret = await CallKernel("msg.getByMsgIds", new
                     {
@@ -1097,6 +1313,9 @@ public class Ob11Server
                         IndexReplyTargets(segments, Ob11.Long(rec, "chatType"), parts[1]);
                         var senderUin = Ob11.Str(rec, "senderUin") ?? await ResolveUinCachedAsync(Ob11.Str(rec, "senderUid") ?? "");
                         LearnUin(Ob11.Str(rec, "senderUid"), senderUin);
+                        RememberMessage(rec, msgId, Ob11.Long(rec, "chatType"), parts[1], isSelfSent: senderUin == SelfUin);
+                        var senderCard = "";
+                        if (_memberCache.TryGetValue($"{parts[1]}|{senderUin}", out var gmc)) senderCard = gmc.Card;
                         var data = new Dictionary<string, object?>
                         {
                             ["time"] = Ob11.Long(rec, "msgTime"),
@@ -1112,6 +1331,7 @@ public class Ob11Server
                             {
                                 ["user_id"] = senderUin,
                                 ["nickname"] = Ob11.Str(rec, "sendNickName") ?? "",
+                                ["card"] = senderCard,
                             },
                         };
                         if (isGroup) data["group_id"] = parts[1];
@@ -1123,7 +1343,8 @@ public class Ob11Server
             case "mark_msg_as_read":
                 {
                     var msgId = Ob11.Str(j, "message_id") ?? throw new Ob11ParamException("message_id");
-                    if (_msgIndex.TryGetValue(msgId, out var idx))
+                    var idx = await FindIndexAsync(msgId);
+                    if (idx is not null)
                     {
                         var parts = idx.Split('|');
                         await CallKernel("msg.setRead", new { chatType = long.Parse(parts[0]), peerUid = parts[1] });
@@ -1231,12 +1452,14 @@ public class Ob11Server
                     {
                         foreach (var m in arr.EnumerateArray())
                         {
-                            // learn uid->uin pairs so at/reply resolution works offline
+                            // learn uid->uin pairs + role/card/level so at/reply/sender work offline
                             var memberUid = Ob11.Str(m, "uid");
-                            LearnUin(memberUid, Ob11.Str(m, "uin"));
+                            var memberUin = Ob11.Str(m, "uin") ?? "";
+                            LearnUin(memberUid, memberUin);
+                            LearnMember(gid, memberUin, RoleToString(Ob11.Str(m, "role")) , Ob11.Long(m, "level").ToString(), Ob11.Str(m, "card"));
                             members.Add(new Dictionary<string, object?>
                             {
-                                ["user_id"] = Ob11.Str(m, "uin") ?? "",
+                                ["user_id"] = memberUin,
                                 ["nickname"] = Ob11.Str(m, "nick") ?? "",
                                 ["card"] = Ob11.Str(m, "card") ?? "",
                                 ["role"] = RoleToString(Ob11.Str(m, "role")),
@@ -1256,7 +1479,10 @@ public class Ob11Server
                     var m = r.TryGetProperty("member", out var mm) && mm.ValueKind == JsonValueKind.Object ? mm : default;
                     long shutTs = 0;
                     if (m.ValueKind == JsonValueKind.Object)
+                    {
                         shutTs = Ob11.Long(m, "shutUpUntilTime", Ob11.Long(m, "shutUp"));
+                        LearnMember(gid, uin, Str3(m, "role"), Ob11.Long(m, "level").ToString(), Str3(m, "cardName"));
+                    }
                     return ToElement(new Dictionary<string, object?>
                     {
                         ["group_id"] = gid,
@@ -1363,8 +1589,54 @@ public class Ob11Server
                 }
 
             case "set_group_add_request":
-                // group request handling needs operateSysNotify with notify seq — v2
-                throw new Ob11UnsupportedException("set_group_add_request pending v2");
+                // group request handling needs operateSysNotify with notify seq — requires bridge support
+                throw new Ob11UnsupportedException("set_group_add_request pending bridge support (operateSysNotify)");
+
+            // ---- 标准剩余 API：显式unsupported（known-but-unsupported → retcode 1200，区别于 1404 未知动作） ----
+            case "send_like":
+                throw new Ob11UnsupportedException("send_like not supported: bridge kernel has no like-send method");
+            case "set_group_anonymous_ban":
+            case "set_group_anonymous":
+                throw new Ob11UnsupportedException("anonymous messaging was removed in NTQQ");
+            case "get_group_honor_info":
+                throw new Ob11UnsupportedException("get_group_honor_info not supported (requires web credentials)");
+
+            // ---- 凭证类：NT 无 web 凭证通道，按 NapCat 口径返回空值 ----
+            case "get_cookies":
+                return ToElement(new { cookies = "" });
+            case "get_csrf_token":
+                return ToElement(new { token = 0 });
+            case "get_credentials":
+                return ToElement(new { cookies = "", csrf_token = 0 });
+
+            case "clean_cache":
+                {
+                    // 标准 clean_cache：清运行期索引缓存；SQLite 消息历史保留（非缓存数据）
+                    _msgIndex.Clear(); _msgIndexOrder.Clear();
+                    _seqIndex.Clear(); _seqIndexOrder.Clear();
+                    _mediaIndex.Clear(); _mediaIndexOrder.Clear();
+                    _markerToRealId.Clear(); _markerOrder.Clear();
+                    _recallEmitted.Clear(); _recallOperator.Clear(); _recentRecallPeer.Clear();
+                    _memberCache.Clear();
+                    lock (_memberFetchLock) { _memberListFetched.Clear(); }
+                    await _store.CleanCacheAsync();
+                    return ToElement(new object());
+                }
+
+            case "set_restart":
+                {
+                    if (!_opts.AllowRestart)
+                        throw new Ob11UnsupportedException("set_restart disabled (AaR:AllowRestart=false)");
+                    var delay = Ob11.Long(j, "delay", 0);
+                    _logger.LogWarning("set_restart: process exit in {Ms}ms (service manager should restart)", delay);
+                    _ = Task.Run(async () =>
+                    {
+                        try { await Task.Delay((int)Math.Max(0, delay)); } catch { }
+                        Environment.Exit(0);
+                    });
+                    // 标准要求 status=async（重启会中断当前响应，返回后立刻执行）
+                    throw new Ob11AsyncSignal();
+                }
 
             case "get_group_at_all_remain":
                 {
@@ -1418,6 +1690,8 @@ public class Ob11Server
                     // also accept a bare md5 even when the caller passes an uuid-ish name
                     if (media is null && file.Length == 32 && file.All(c => Uri.IsHexDigit(c)))
                         _mediaIndex.TryGetValue(new string(file.ToLowerInvariant().ToArray()), out media);
+                    // SQLite 回查（重启后仍可取 media 引用），命中回填内存 L1
+                    media ??= await FindMediaAsync(key);
                     string url = media?.Url ?? "";
                     string? local = media?.LocalPath;
                     if (local is null || !File.Exists(local))
@@ -1455,6 +1729,13 @@ public class Ob11Server
                         if (kind == "file") data["file_id"] = key;
                         if (media?.LocalPath is { } lp && File.Exists(lp)) data["path"] = lp;
                     }
+                    // 标准 get_record 支持 out_format（mp3/amr/…）：ffmpeg 尽力转换，失败返回原文件
+                    if (kind == "record" && local is not null &&
+                        Ob11.Str(j, "out_format") is { } outFmt && !string.IsNullOrWhiteSpace(outFmt))
+                    {
+                        var converted = await TryConvertAudioAsync(local, outFmt);
+                        if (converted is not null) { data["file"] = converted; data["path"] = converted; }
+                    }
                     return ToElement(data);
                 }
 
@@ -1478,8 +1759,8 @@ public class Ob11Server
             case "set_msg_emoji_like":
                 {
                     var msgId = Ob11.Str(j, "message_id") ?? throw new Ob11ParamException("message_id");
-                    if (!_msgIndex.TryGetValue(msgId, out var idx))
-                        throw new Ob11BadException("unknown message_id: " + msgId);
+                    var idx = await FindIndexAsync(msgId)
+                        ?? throw new Ob11BadException("unknown message_id: " + msgId);
                     var parts = idx.Split('|');
                     return await CallKernel("msg.emojiLike", new
                     {
@@ -1513,18 +1794,34 @@ public class Ob11Server
 
             case "get_forward_msg":
                 {
-                    // getMultiMsg(peer, rootMsgId, parentMsgId) — needs the CONTAINER's msgId,
-                    // which must be indexed from a forward message_sent/recv event.
-                    var msgId = Ob11.Str(j, "message_id") ?? Ob11.Str(j, "res_id") ?? throw new Ob11ParamException("message_id");
-                    if (!_msgIndex.TryGetValue(msgId, out var fidx))
-                        throw new Ob11BadException("forward container not indexed (send/observe it first): " + msgId);
-                    var fp = fidx.Split('|');
+                    // 标准参数是 id；NapCat 风格的 message_id/res_id 一并接受。
+                    // 容器定位优先查存储（real msgId ↔ resId），回退内存索引。
+                    var msgId = Ob11.Str(j, "id") ?? Ob11.Str(j, "message_id") ?? Ob11.Str(j, "res_id")
+                        ?? throw new Ob11ParamException("id");
+                    long chatType;
+                    string peerUid, containerMsgId;
+                    var fwd = await _store.GetForwardAsync(msgId) ?? await _store.GetForwardByResIdAsync(msgId);
+                    if (fwd is not null)
+                    {
+                        containerMsgId = fwd.MessageId;
+                        chatType = fwd.ChatType;
+                        peerUid = fwd.PeerUid;
+                    }
+                    else
+                    {
+                        var idx = await FindIndexAsync(msgId)
+                            ?? throw new Ob11BadException("forward container not indexed (send/observe it first): " + msgId);
+                        var fp = idx.Split('|');
+                        chatType = long.Parse(fp[0]);
+                        peerUid = fp[1];
+                        containerMsgId = msgId;
+                    }
                     var r = await CallKernel("msg.getForward", new
                     {
-                        chatType = long.Parse(fp[0]),
-                        peerUid = fp[1],
-                        rootMsgId = msgId,
-                        parentMsgId = msgId,
+                        chatType,
+                        peerUid,
+                        rootMsgId = containerMsgId,
+                        parentMsgId = containerMsgId,
                     });
                     var msgList = r.TryGetProperty("msgList", out var ml) ? ml : (JsonElement)default;
                     if (msgList.ValueKind == JsonValueKind.Array && msgList.GetArrayLength() > 0)
@@ -1573,8 +1870,8 @@ public class Ob11Server
             case "set_essence_msg":
                 {
                     var msgId = Ob11.Str(j, "message_id") ?? throw new Ob11ParamException("message_id");
-                    if (!_msgIndex.TryGetValue(msgId, out var eidx))
-                        throw new Ob11BadException("unknown message_id: " + msgId);
+                    var eidx = await FindIndexAsync(msgId)
+                        ?? throw new Ob11BadException("unknown message_id: " + msgId);
                     var ep = eidx.Split('|');
                     return await CallKernel("group.essence.add", new { groupCode = ep[1], msgId });
                 }
@@ -1582,8 +1879,8 @@ public class Ob11Server
             case "del_essence_msg":
                 {
                     var msgId = Ob11.Str(j, "message_id") ?? throw new Ob11ParamException("message_id");
-                    if (!_msgIndex.TryGetValue(msgId, out var didx))
-                        throw new Ob11BadException("unknown message_id: " + msgId);
+                    var didx = await FindIndexAsync(msgId)
+                        ?? throw new Ob11BadException("unknown message_id: " + msgId);
                     var dp = didx.Split('|');
                     return await CallKernel("group.essence.remove", new { groupCode = dp[1], msgId });
                 }
@@ -1645,7 +1942,8 @@ public class Ob11Server
                 }
 
             default:
-                throw new Ob11UnsupportedException("unknown action: " + action);
+                // 标准口径：未知动作 → retcode 1404（HTTP 404 / WS 1404）
+                throw new Ob11UnknownActionException("unknown action: " + action);
         }
     }
 
@@ -1671,6 +1969,38 @@ public class Ob11Server
             return n.GetString();
         if (prof.TryGetProperty("nick", out var n2)) return n2.GetString();
         return null;
+    }
+
+    /// <summary>ffmpeg 尽力转换语音格式（get_record out_format）；失败返回 null（调用方回退原文件）。</summary>
+    private static async Task<string?> TryConvertAudioAsync(string src, string outFormat)
+    {
+        var fmt = outFormat.TrimStart('.').ToLowerInvariant();
+        if (fmt is not ("mp3" or "amr" or "wma" or "m4a" or "spx" or "ogg" or "wav" or "flac")) return null;
+        var ffmpeg = Ob11Mapper.FindFfmpeg();
+        if (ffmpeg is null || !File.Exists(src)) return null;
+        var dst = Path.Combine(Path.GetTempPath(), "aar", "audio-" + Guid.NewGuid().ToString("N") + "." + fmt);
+        Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
+        try
+        {
+            using var proc = new System.Diagnostics.Process();
+            proc.StartInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = ffmpeg,
+                Arguments = "-y -v error -i \"" + src + "\" \"" + dst + "\"",
+                UseShellExecute = false,
+                RedirectStandardError = true,
+            };
+            proc.Start();
+            var wait = proc.WaitForExitAsync();
+            var done = await Task.WhenAny(wait, Task.Delay(20000));
+            if (done != wait)
+            {
+                try { proc.Kill(true); } catch { }
+                return null;
+            }
+            return wait.IsCompletedSuccessfully && proc.ExitCode == 0 && File.Exists(dst) ? dst : null;
+        }
+        catch { return null; }
     }
 
     private static string? Str3(JsonElement obj, string name)
@@ -1730,6 +2060,8 @@ public class Ob11Server
             try
             {
                 if (ws.State != System.Net.WebSockets.WebSocketState.Open) { RemoveWsClient(kv.Key); continue; }
+                // /api 专用连接不收事件（标准：事件只推 universal/event 连接）
+                if (_wsModes.TryGetValue(kv.Key, out var m) && m == WsClientMode.Api) continue;
                 // per-connection send lock: parallel WebSocket.SendAsync on one socket
                 // throws InvalidOperationException and would drop the client
                 await SendWsFrameAsync(kv.Key, ws, bytes);

@@ -77,10 +77,36 @@ public class Ob11Response
     public object? Data { get; set; }
     public string? Wording { get; set; }
     public string? Echo { get; set; }
+    /// <summary>echo 原样保真（标准：echo 可以是任意 JSON 类型）。设置后序列化优先于 Echo。</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public JsonElement? EchoRaw { get; set; }
 
-    public static Ob11Response Ok(object? data = null, string? echo = null) =>
-        new() { Status = "ok", Retcode = Ob11.RetOk, Data = data ?? new object(), Echo = echo };
+    public static Ob11Response Ok(object? data = null, string? echo = null, JsonElement? echoRaw = null) =>
+        new() { Status = "ok", Retcode = Ob11.RetOk, Data = data ?? new object(), Echo = echo, EchoRaw = echoRaw };
 
-    public static Ob11Response Fail(int retcode, string wording = "", object? data = null, string? echo = null) =>
-        new() { Status = "failed", Retcode = retcode, Wording = wording, Data = data ?? new object(), Echo = echo };
+    /// <summary>标准异步响应：status=async, retcode=1, data=null。</summary>
+    public static Ob11Response Async(string? echo = null, JsonElement? echoRaw = null) =>
+        new() { Status = "async", Retcode = 1, Data = null, Echo = echo, EchoRaw = echoRaw };
+
+    public static Ob11Response Fail(int retcode, string wording = "", object? data = null, string? echo = null, JsonElement? echoRaw = null) =>
+        new() { Status = "failed", Retcode = retcode, Wording = wording, Data = data ?? new object(), Echo = echo, EchoRaw = echoRaw };
+
+    /// <summary>Wire JSON：status/retcode/data/wording/echo，echo 为原始 JSON 类型。</summary>
+    public string ToJson()
+    {
+        var dict = new Dictionary<string, object?>
+        {
+            ["status"] = Status,
+            ["retcode"] = Retcode,
+            ["data"] = Data,
+            ["wording"] = Wording, // null → 序列化时省略
+            ["echo"] = EchoRaw ?? (object?)Echo,
+        };
+        return Ob11Json.Serialize(dict);
+    }
 }
+
+/// <summary>标准：API 不存在（HTTP 404 / WS retcode 1404）。</summary>
+public class Ob11UnknownActionException(string msg) : Exception(msg);
+/// <summary>set_restart 等已受理但响应被中断的动作 → status=async。</summary>
+public class Ob11AsyncSignal : Exception;

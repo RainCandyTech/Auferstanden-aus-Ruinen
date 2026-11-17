@@ -6,9 +6,11 @@ using AaR.Server.Ob11;
 namespace AaR.Server.Middleware;
 
 /// <summary>
-/// OneBot v11 forward-WebSocket endpoint at /ws:
-/// clients connect, send {"action","params","echo"} frames and receive
-/// {"status","retcode","data","echo"} responses plus pushed events.
+/// OneBot v11 forward-WebSocket endpoints (standard):
+///   {Ob11WsPath}            → universal（API + 事件，同一连接）
+///   {Ob11WsPath}/api        → 仅 API
+///   {Ob11WsPath}/event      → 仅事件推送（收到的 API 请求被忽略）
+/// 客户端发送 {"action","params","echo"}，得到 {"status","retcode","data","echo"}。
 /// </summary>
 public class Ob11WebSocketMiddleware
 {
@@ -25,7 +27,20 @@ public class Ob11WebSocketMiddleware
 
     public async Task InvokeAsync(HttpContext ctx, RequestDelegate next)
     {
-        if (!ctx.Request.Path.Equals(_opts.Ob11WsPath, StringComparison.OrdinalIgnoreCase))
+        var basePath = _opts.Ob11WsPath.TrimEnd('/');
+        var path = ctx.Request.Path.Value ?? "";
+
+        Ob11Server.WsClientMode mode;
+        if (path.Equals(basePath, StringComparison.OrdinalIgnoreCase) ||
+            path.Equals(basePath + "/", StringComparison.OrdinalIgnoreCase))
+            mode = Ob11Server.WsClientMode.Universal;
+        else if (path.Equals(basePath + "/api", StringComparison.OrdinalIgnoreCase) ||
+                 path.Equals(basePath + "/api/", StringComparison.OrdinalIgnoreCase))
+            mode = Ob11Server.WsClientMode.Api;
+        else if (path.Equals(basePath + "/event", StringComparison.OrdinalIgnoreCase) ||
+                 path.Equals(basePath + "/event/", StringComparison.OrdinalIgnoreCase))
+            mode = Ob11Server.WsClientMode.Event;
+        else
         {
             await next(ctx);
             return;
@@ -56,7 +71,7 @@ public class Ob11WebSocketMiddleware
         // register before the first send so the lifecycle frame and every later
         // frame share the server-side per-connection send lock
         var clientId = Guid.NewGuid().ToString("N");
-        _ob11.RegisterWsClient(clientId, ws);
+        _ob11.RegisterWsClient(clientId, ws, mode);
         // P1-1: late-connecting clients must receive lifecycle connect immediately
         try
         {
@@ -68,12 +83,11 @@ public class Ob11WebSocketMiddleware
                 ["meta_event_type"] = "lifecycle",
                 ["sub_type"] = "connect",
             };
-            var connectJson = Ob11Json.Serialize(connectEvt);
-            var connectBytes = Encoding.UTF8.GetBytes(connectJson);
+            var connectBytes = Encoding.UTF8.GetBytes(Ob11Json.Serialize(connectEvt));
             await _ob11.SendWsFrameAsync(clientId, ws, connectBytes);
         }
         catch { }
-        _logger.LogInformation("ob11 ws client connected: {Id}", clientId);
+        _logger.LogInformation("ob11 ws client connected: {Id} mode={Mode}", clientId, mode);
 
         var buffer = new byte[1024 * 256];
         try
@@ -95,6 +109,8 @@ public class Ob11WebSocketMiddleware
 
                 if (result.MessageType == WebSocketMessageType.Close) break;
                 var text = Encoding.UTF8.GetString(ms.ToArray());
+                // /event 专用连接不提供 API（标准：需要 API 用 /api 或 universal）
+                if (mode == Ob11Server.WsClientMode.Event) continue;
                 _ = HandleClientFrameAsync(clientId, ws, text);
             }
         }
@@ -109,32 +125,36 @@ public class Ob11WebSocketMiddleware
 
     private async Task HandleClientFrameAsync(string clientId, WebSocket ws, string text)
     {
+        JsonElement? echoRaw = null;
         string? echo = null;
         try
         {
             using var doc = JsonDocument.Parse(text);
             var root = doc.RootElement;
-            echo = root.TryGetProperty("echo", out var e) ? e.ToString() : null;
+            if (root.TryGetProperty("echo", out var e))
+            {
+                echoRaw = e.Clone(); // 标准：echo 可为任意 JSON 类型，原样返回
+                echo = e.ToString();
+            }
             var action = root.TryGetProperty("action", out var a) ? a.GetString() ?? "" : "";
             var p = new Dictionary<string, object?>();
             if (root.TryGetProperty("params", out var ps) && ps.ValueKind == JsonValueKind.Object)
                 foreach (var prop in ps.EnumerateObject())
                     p[prop.Name] = prop.Value.Clone();
 
-            var response = await _ob11.HandleActionAsync(action, p, echo);
-            await SendAsync(clientId, ws, response);
+            var response = await _ob11.HandleActionAsync(action, p, echo, echoRaw);
+            await SendAsync(clientId, ws, response.ToJson());
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "ob11 ws frame failed");
-            await SendAsync(clientId, ws, Ob11Response.Fail(-1, ex.Message, echo: echo));
+            await SendAsync(clientId, ws, Ob11Response.Fail(-1, ex.Message, echo: echo, echoRaw: echoRaw).ToJson());
         }
     }
 
-    private async Task SendAsync(string clientId, WebSocket ws, Ob11Response response)
+    private async Task SendAsync(string clientId, WebSocket ws, string json)
     {
         if (ws.State != WebSocketState.Open) return;
-        var json = Ob11Json.Serialize(response);
         var bytes = Encoding.UTF8.GetBytes(json);
         // shared per-connection lock: responses race with event broadcasts
         await _ob11.SendWsFrameAsync(clientId, ws, bytes);

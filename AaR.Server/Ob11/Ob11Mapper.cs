@@ -286,6 +286,10 @@ public static class Ob11Mapper
                         list.Add(new Dictionary<string, object?> { ["type"] = "text", ["data"] = new { text = s.GetString() } });
                 }
                 break;
+            case JsonValueKind.Object:
+                // 标准：message 参数允许字符串、消息段数组、单个消息段对象三种形态
+                list.Add(ObjToDict(message));
+                break;
             case JsonValueKind.String:
                 list.AddRange(CqCodeToSegments(message.GetString() ?? ""));
                 break;
@@ -398,7 +402,7 @@ public static class Ob11Mapper
     private static string? _ffmpegPath;
 
     /// <summary>Locate ffmpeg on PATH (result cached; empty string = negative cache).</summary>
-    private static string? FindFfmpeg()
+    public static string? FindFfmpeg()
     {
         if (_ffmpegPath is not null) return _ffmpegPath.Length > 0 ? _ffmpegPath : null;
         var dirs = new List<string>();
@@ -857,10 +861,13 @@ public static class Ob11Mapper
             else if (Has(el, "arkElement"))
             {
                 var ae = el.GetProperty("arkElement");
-                segments.Add(Seg("json", new Dictionary<string, object?>
-                {
-                    ["data"] = Str2(ae, "bytesData") ?? "{}",
-                }));
+                var arkData = Str2(ae, "bytesData") ?? "{}";
+                // NT 合并转发以 multimsg ark 承载 —— 按标准输出 forward 段（id=resId）
+                var forwardResId = TryExtractForwardResId(arkData);
+                if (forwardResId is not null)
+                    segments.Add(Seg("forward", new Dictionary<string, object?> { ["id"] = forwardResId }));
+                else
+                    segments.Add(Seg("json", new Dictionary<string, object?> { ["data"] = arkData }));
             }
             else if (Has(el, "markdownElement"))
             {
@@ -940,6 +947,39 @@ public static class Ob11Mapper
     }
 
 
+    /// <summary>multimsg ark → 合并转发 resId（非 multimsg ark 返回 null，走 json 段）。</summary>
+    private static string? TryExtractForwardResId(string arkJson)
+    {
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(arkJson);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("app", out var app) || app.GetString() != "com.tencent.multimsg")
+                return null;
+            if (root.TryGetProperty("meta", out var meta) &&
+                meta.TryGetProperty("detail", out var detail) &&
+                detail.TryGetProperty("resid", out var rid) &&
+                rid.ValueKind == JsonValueKind.String)
+                return rid.GetString();
+        }
+        catch { }
+        return null;
+    }
+
+    /// <summary>收集 message（string/array/单个对象）里所有 reply 段的 id（供持久层回查）。</summary>
+    public static List<string> CollectReplyIds(JsonElement message)
+    {
+        var ids = new List<string>();
+        foreach (var seg in NormalizeSegments(message))
+        {
+            if (!seg.TryGetValue("type", out var t) || t?.ToString() != "reply") continue;
+            if (seg.TryGetValue("data", out var d) && d is Dictionary<string, object?> dd &&
+                dd.TryGetValue("id", out var id))
+                ids.Add(id?.ToString() ?? "");
+        }
+        return ids;
+    }
+
     private static string? Str2(JsonElement obj, string name) =>
         obj.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
 
@@ -952,21 +992,28 @@ public static class Ob11Mapper
             var data = s.TryGetValue("data", out var d) && d is Dictionary<string, object?> dd ? dd : new Dictionary<string, object?>();
             switch (type)
             {
-                case "text": sb.Append(data.TryGetValue("text", out var tx) ? tx : ""); break;
-                case "at": sb.Append("[CQ:at,qq=").Append(data.TryGetValue("qq", out var q) ? q : "").Append(']'); break;
-                case "face": sb.Append("[CQ:face,id=").Append(data.TryGetValue("id", out var f) ? f : "").Append(']'); break;
-                case "reply": sb.Append("[CQ:reply,id=").Append(data.TryGetValue("id", out var r) ? r : "").Append(']'); break;
-                case "image": sb.Append("[CQ:image,file=").Append(data.TryGetValue("file", out var im) ? im : "").Append(']'); break;
-                case "record": sb.Append("[CQ:record,file=").Append(data.TryGetValue("file", out var rc) ? rc : "").Append(']'); break;
-                case "video": sb.Append("[CQ:video,file=").Append(data.TryGetValue("file", out var vd) ? vd : "").Append(']'); break;
-                case "file": sb.Append("[CQ:file,name=").Append(data.TryGetValue("name", out var fn) ? fn : "").Append(']'); break;
-                case "json": sb.Append("[CQ:json,data=").Append(data.TryGetValue("data", out var js) ? js : "").Append(']'); break;
-                case "markdown": sb.Append("[CQ:markdown,content=").Append(data.TryGetValue("content", out var md) ? md : "").Append(']'); break;
-                case "mface": sb.Append("[CQ:mface,emoji_id=").Append(data.TryGetValue("emoji_id", out var mf) ? mf : "").Append(']'); break;
+                // 标准：raw_message 的纯文本需转义 & [ ]；CQ 参数值额外转义 ,
+                case "text": sb.Append(CqEscapeText(data.TryGetValue("text", out var tx) ? tx : "")); break;
+                case "at": sb.Append("[CQ:at,qq=").Append(CqEscapeParam(data.TryGetValue("qq", out var q) ? q : "")).Append(']'); break;
+                case "face": sb.Append("[CQ:face,id=").Append(CqEscapeParam(data.TryGetValue("id", out var f) ? f : "")).Append(']'); break;
+                case "reply": sb.Append("[CQ:reply,id=").Append(CqEscapeParam(data.TryGetValue("id", out var r) ? r : "")).Append(']'); break;
+                case "image": sb.Append("[CQ:image,file=").Append(CqEscapeParam(data.TryGetValue("file", out var im) ? im : "")).Append(']'); break;
+                case "record": sb.Append("[CQ:record,file=").Append(CqEscapeParam(data.TryGetValue("file", out var rc) ? rc : "")).Append(']'); break;
+                case "video": sb.Append("[CQ:video,file=").Append(CqEscapeParam(data.TryGetValue("file", out var vd) ? vd : "")).Append(']'); break;
+                case "file": sb.Append("[CQ:file,name=").Append(CqEscapeParam(data.TryGetValue("name", out var fn) ? fn : "")).Append(']'); break;
+                case "json": sb.Append("[CQ:json,data=").Append(CqEscapeParam(data.TryGetValue("data", out var js) ? js : "")).Append(']'); break;
+                case "markdown": sb.Append("[CQ:markdown,content=").Append(CqEscapeParam(data.TryGetValue("content", out var md) ? md : "")).Append(']'); break;
+                case "mface": sb.Append("[CQ:mface,emoji_id=").Append(CqEscapeParam(data.TryGetValue("emoji_id", out var mf) ? mf : "")).Append(']'); break;
+                case "forward": sb.Append("[CQ:forward,id=").Append(CqEscapeParam(data.TryGetValue("id", out var fw) ? fw : "")).Append(']'); break;
             }
         }
         return sb.ToString();
     }
+
+    private static string CqEscapeText(object? v) => (v?.ToString() ?? "")
+        .Replace("&", "&amp;").Replace("[", "&#91;").Replace("]", "&#93;");
+    private static string CqEscapeParam(object? v) =>
+        CqEscapeText(v).Replace(",", "&#44;");
 }
 
 public class Ob11UnsupportedException(string msg) : Exception(msg);

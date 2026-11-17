@@ -174,25 +174,30 @@ public class ReversePushService : BackgroundService
 
     private async Task HandleReverseApiFrameAsync(int idx, ClientWebSocket ws, string text, CancellationToken ct)
     {
+        JsonElement? echoRaw = null;
         string? echo = null;
         try
         {
             using var doc = JsonDocument.Parse(text);
             var root = doc.RootElement;
-            echo = root.TryGetProperty("echo", out var e) ? e.ToString() : null;
+            if (root.TryGetProperty("echo", out var e))
+            {
+                echoRaw = e.Clone(); // 标准：echo 原样返回
+                echo = e.ToString();
+            }
             var action = root.TryGetProperty("action", out var a) ? a.GetString() ?? "" : "";
             var p = new Dictionary<string, object?>();
             if (root.TryGetProperty("params", out var ps) && ps.ValueKind == JsonValueKind.Object)
                 foreach (var prop in ps.EnumerateObject())
                     p[prop.Name] = prop.Value.Clone();
 
-            var response = await _ob11.HandleActionAsync(action, p, echo);
-            await SendFrameAsync(idx, ws, Ob11Json.Serialize(response), ct);
+            var response = await _ob11.HandleActionAsync(action, p, echo, echoRaw);
+            await SendFrameAsync(idx, ws, response.ToJson(), ct);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "reverse-ws api frame failed");
-            try { await SendFrameAsync(idx, ws, Ob11Json.Serialize(Ob11Response.Fail(-1, ex.Message, echo: echo)), ct); }
+            try { await SendFrameAsync(idx, ws, Ob11Response.Fail(-1, ex.Message, echo: echo, echoRaw: echoRaw).ToJson(), ct); }
             catch { }
         }
     }

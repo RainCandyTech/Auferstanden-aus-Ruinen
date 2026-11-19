@@ -1101,4 +1101,9 @@ public static class Ob11Mapper
 
 public class Ob11UnsupportedException(string msg) : Exception(msg);
 public class Ob11BadException(string msg) : Exception(msg);
+/// <summary>动作确定性失败（内核 result≠0）：1200 封包，Payload 携带诊断 data。</summary>
+public class Ob11ActionFailedException(string msg, object? payload = null) : Exception(msg)
+{
+    public object? Payload { get; } = payload;
+}
 public class Ob11EmptyException(string msg) : Exception(msg);

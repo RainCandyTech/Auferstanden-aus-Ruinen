@@ -23,7 +23,7 @@ public class Ob11Server
     public volatile string SelfNick = "";
 
     /// <summary>Server version reported by get_version_info and the #AaR debug command.</summary>
-    public const string ServerVersion = "0.5.1";
+    public const string ServerVersion = "0.5.2";
 
     // msgId -> "chatType|peerUid|seq" for delete_msg / get_msg / reply building
     private readonly ConcurrentDictionary<string, string> _msgIndex = new();
@@ -1137,6 +1137,11 @@ public class Ob11Server
         {
             return Ob11Response.Fail(Ob11.RetUnsupported, ex.Message, echo: echo, echoRaw: echoRaw);
         }
+        catch (Ob11ActionFailedException ex)
+        {
+            // 0.5.2：动作确定性失败（如 send result≠0）→ 1200 + data 诊断负载
+            return Ob11Response.Fail(Ob11.RetActionFailed, ex.Message, data: ex.Payload, echo: echo, echoRaw: echoRaw);
+        }
         catch (Ob11ParamException ex)
         {
             return Ob11Response.Fail(Ob11.RetParamMissing, ex.Message, echo: echo, echoRaw: echoRaw);
@@ -1259,6 +1264,21 @@ public class Ob11Server
                     var hasFile = elements.Any(e => e.TryGetValue("elementType", out var et) && et is int i3 && i3 == 3);
                     var ret = await CallKernel("msg.send", new { chatType, peerUid = uid, elements }, hasFile ? 180_000 : null);
                     var delivered = ret.TryGetProperty("delivered", out var dv) && dv.ValueKind == JsonValueKind.True;
+                    // 0.5.2 折中语义（用户裁定）：内核 result≠0 = 确定性失败 → 标准 1200 封包
+                    // （go-cqhttp ActionFailed 口径，data 保留诊断字段）；result=0 而 delivered=false
+                    // 是 NT 假阴性区间（实拍偶发、消息可能实际送达）——保持 retcode 0 + delivered
+                    // 扩展字段，避免客户端见 1200 自动重发造成重复消息
+                    if (ret.TryGetProperty("result", out var rs) && rs.ValueKind == JsonValueKind.Number && rs.GetInt32() != 0)
+                        throw new Ob11ActionFailedException(
+                            $"send failed: result={rs.GetInt32()}" +
+                            (ret.TryGetProperty("errMsg", out var em) && !string.IsNullOrEmpty(em.GetString()) ? $" {em.GetString()}" : ""),
+                            new Dictionary<string, object?>
+                            {
+                                ["message_id"] = ret.TryGetProperty("msgId", out var mk) ? mk.GetString() ?? "" : "",
+                                ["delivered"] = false,
+                                ["result"] = rs.GetInt32(),
+                                ["errMsg"] = ret.TryGetProperty("errMsg", out var em2) ? em2.GetString() : null,
+                            });
                     // the generated uniqueId marker differs from the real msgId QQ assigns
                     // (real = marker + 1 in practice); we tracked the real id via the
                     // onMsgInfoListUpdate record — look it up by marker in the msg index.

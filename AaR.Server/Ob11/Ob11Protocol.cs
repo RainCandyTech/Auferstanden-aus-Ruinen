@@ -26,6 +26,8 @@ public static class Ob11
     public const int RetParamBad = 104;
     public const int RetNetworkError = 201;
     public const int RetUnsupported = 1200;
+    /// <summary>动作确定性失败（如发送被服务器拒绝 result≠0）——go-cqhttp ActionFailed 口径，同为 1200。</summary>
+    public const int RetActionFailed = 1200;
 
     public static JsonElement Get(JsonElement obj, string name)
     {

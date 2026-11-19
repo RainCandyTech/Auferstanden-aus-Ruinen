@@ -23,7 +23,7 @@ public class Ob11Server
     public volatile string SelfNick = "";
 
     /// <summary>Server version reported by get_version_info and the #AaR debug command.</summary>
-    public const string ServerVersion = "0.5.2";
+    public const string ServerVersion = "0.6.0";
 
     // msgId -> "chatType|peerUid|seq" for delete_msg / get_msg / reply building
     private readonly ConcurrentDictionary<string, string> _msgIndex = new();
@@ -1255,8 +1255,7 @@ public class Ob11Server
                     }
                     var elements = await Ob11Mapper.SegmentsToElementsAsync(
                         message, _bridge, _hub, _msgIndex, chatType, uid,
-                        async uin => (await CallKernel("uin.toUid", new { uin })).TryGetProperty("uid", out var u) ? u.GetString() : null,
-                        _opts.SilkEncoderPath);
+                        async uin => (await CallKernel("uin.toUid", new { uin })).TryGetProperty("uid", out var u) ? u.GetString() : null);
                     var autoEscape = Ob11.Bool(j, "auto_escape");
                     if (autoEscape)
                         elements = new List<Dictionary<string, object?>> { Ob11Mapper.TextEl(BuildRawText(j)) };

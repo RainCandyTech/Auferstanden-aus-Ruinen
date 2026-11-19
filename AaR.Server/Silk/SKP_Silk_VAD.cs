@@ -1,0 +1,369 @@
+#nullable disable
+// ***********************************************************************
+// Copyright (c) 2006-2012, Skype Limited. All rights reserved.
+// Redistribution and use in source and binary forms, with or without
+// modification, (subject to the limitations in the disclaimer below)
+// are permitted provided that the following conditions are met:
+// - Redistributions of source code must retain the above copyright notice,
+//   this list of conditions and the following disclaimer.
+// - Redistributions in binary form must reproduce the above copyright
+//   notice, this list of conditions and the following disclaimer in the
+//   documentation and/or other materials provided with the distribution.
+// - Neither the name of Skype Limited, nor the names of specific
+//   contributors, may be used to endorse or promote products derived from
+//   this software without specific prior written permission.
+// NO EXPRESS OR IMPLIED LICENSES ARE GRANTED TO ANY PARTY'S PATENT RIGHTS
+// BY THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+// CONTRIBUTORS ''AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING,
+// BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+// FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+// COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+// INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+// NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
+// USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+// ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+// THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// ***********************************************************************
+// SKP_Silk_VAD.cs —— 移植自 SILK SDK v1.0.9（fixed-point）：
+//   src/SKP_Silk_VAD.c（函数 SKP_Silk_VAD_Init / SKP_Silk_VAD_GetSA_Q8 /
+//   SKP_Silk_VAD_GetNoiseLevels）
+// 移植说明：
+//   - 本 C 文件内没有与文件同名的函数，类名保持 SKP_Silk_VAD（无 _impl 后缀）。
+//   - SKP_Silk_ana_filt_bank_1 为 DSP 簇产物，按 SigProc_FIX.h 原型推导签名
+//     （各指针参数 → 数组 + 紧随偏移），裸名调用。
+//   - 整结构体清零：SKP_memset( psSilk_VAD, 0, sizeof( ... ) ) → psSilk_VAD.Clear()
+//     （地基 SKP_Silk_VAD_state 已提供）。
+//   - SKP_uint8_MAX = 255、SKP_int32_MAX = int.MaxValue 以字面/库常量表达。
+//   - SKP_assert 在 C 构建中为空宏，按移植规约删除。
+// ***********************************************************************
+
+using System.Runtime.CompilerServices;
+using static AaR.Server.Silk.SKP_Silk_macros;
+using static AaR.Server.Silk.SKP_Silk_define;
+using static AaR.Server.Silk.SKP_Silk_tuning_parameters;
+using static AaR.Server.Silk.SKP_Silk_Inlines;
+using static AaR.Server.Silk.SKP_Silk_ana_filt_bank_1_impl;
+using static AaR.Server.Silk.SKP_Silk_lin2log_impl;
+using static AaR.Server.Silk.SKP_Silk_sigm_Q15_impl;
+
+namespace AaR.Server.Silk;
+
+/// <summary>src/SKP_Silk_VAD.c —— Silk VAD。</summary>
+internal static class SKP_Silk_VAD
+{
+    /**********************************/
+    /* Initialization of the Silk VAD */
+    /**********************************/
+    public static int SKP_Silk_VAD_Init(                              /* O    Return value, 0 if success                  */
+        SKP_Silk_VAD_state psSilk_VAD                                  /* I/O  Pointer to Silk VAD state                   */
+        )
+    {
+        int b, ret = 0;
+
+        /* reset state memory */
+        // 对应 C：SKP_memset( psSilk_VAD, 0, sizeof( SKP_Silk_VAD_state ) )
+        psSilk_VAD.Clear();
+
+        /* init noise levels */
+        /* Initialize array with approx pink noise levels (psd proportional to inverse of frequency) */
+        for( b = 0; b < VAD_N_BANDS; b++ )
+        {
+            psSilk_VAD.NoiseLevelBias[ b ] = SKP_max_32( SKP_DIV32_16( VAD_NOISE_LEVELS_BIAS, b + 1 ), 1 );
+        }
+
+        /* Initialize state */
+        for( b = 0; b < VAD_N_BANDS; b++ )
+        {
+            psSilk_VAD.NL[ b ]     = SKP_MUL( 100, psSilk_VAD.NoiseLevelBias[ b ] );
+            psSilk_VAD.inv_NL[ b ] = SKP_DIV32( int.MaxValue /* SKP_int32_MAX */, psSilk_VAD.NL[ b ] );
+        }
+        psSilk_VAD.counter = 15;
+
+        /* init smoothed energy-to-noise ratio*/
+        for( b = 0; b < VAD_N_BANDS; b++ )
+        {
+            psSilk_VAD.NrgRatioSmth_Q8[ b ] = 100 * 256;       /* 100 * 256 --> 20 dB SNR */
+        }
+
+        return ret;
+    }
+
+    /* Weighting factors for tilt measure */
+    internal static readonly int[] tiltWeights = new int[] { 30000, 6000, -12000, -12000 };
+
+    /***************************************/
+    /* Get the speech activity level in Q8 */
+    /***************************************/
+    public static int SKP_Silk_VAD_GetSA_Q8(                                    /* O    Return value, 0 if success      */
+        SKP_Silk_VAD_state psSilk_VAD,                    /* I/O  Silk VAD state                  */
+        out int pSA_Q8,                                   /* O    Speech activity level in Q8     */
+        out int pSNR_dB_Q7,                               /* O    SNR for current frame in Q7     */
+        int[] pQuality_Q15, int pQuality_Q15Off,           /* O    Smoothed SNR for each band      */
+        out int pTilt_Q15,                                /* O    current frame's frequency tilt  */
+        short[] pIn, int pInOff,                          /* I    PCM input       [framelength]   */
+        int framelength                                   /* I    Input frame length              */
+        )
+    {
+        int SA_Q15, input_tilt;
+        int[] scratch = new int[ 3 * MAX_FRAME_LENGTH / 2 ];
+        int decimated_framelength, dec_subframe_length, dec_subframe_offset, SNR_Q7, i, b, s;
+        // PORT-NOTE: C 声明 SKP_int32 sumSquared 未初始化；VAD_INTERNAL_SUBFRAMES 恒为 4，
+        //   循环体必执行（s==0 即赋值 0），C# 流分析对 for 循环保守报 CS0165，故补 0 初始化（值必被覆盖，语义不变）。
+        int sumSquared = 0;
+        int smooth_coef_Q16;
+        short HPstateTmp;
+
+        // PORT-NOTE: C 局部二维数组 SKP_int16 X[ VAD_N_BANDS ][ MAX_FRAME_LENGTH / 2 ]
+        //   → 交错数组 short[][]，访问形态 X[ b ][ i ] 不变。
+        short[][] X = new short[ VAD_N_BANDS ][];
+        for( int xi = 0; xi < VAD_N_BANDS; xi++ )
+        {
+            X[ xi ] = new short[ MAX_FRAME_LENGTH / 2 ];
+        }
+        int[] Xnrg = new int[ VAD_N_BANDS ];
+        int[] NrgToNoiseRatio_Q8 = new int[ VAD_N_BANDS ];
+        int speech_nrg, x_tmp;
+        int ret = 0;
+
+        /***********************/
+        /* Filter and Decimate */
+        /***********************/
+        /* 0-8 kHz to 0-4 kHz and 4-8 kHz */
+        SKP_Silk_ana_filt_bank_1( pIn, pInOff, psSilk_VAD.AnaState, 0, X[ 0 ], 0, X[ 3 ], 0, scratch, 0, framelength );
+
+        /* 0-4 kHz to 0-2 kHz and 2-4 kHz */
+        SKP_Silk_ana_filt_bank_1( X[ 0 ], 0, psSilk_VAD.AnaState1, 0, X[ 0 ], 0, X[ 2 ], 0, scratch, 0, SKP_RSHIFT( framelength, 1 ) );
+
+        /* 0-2 kHz to 0-1 kHz and 1-2 kHz */
+        SKP_Silk_ana_filt_bank_1( X[ 0 ], 0, psSilk_VAD.AnaState2, 0, X[ 0 ], 0, X[ 1 ], 0, scratch, 0, SKP_RSHIFT( framelength, 2 ) );
+
+        /*********************************************/
+        /* HP filter on lowest band (differentiator) */
+        /*********************************************/
+        decimated_framelength = SKP_RSHIFT( framelength, 3 );
+        X[ 0 ][ decimated_framelength - 1 ] = (short)SKP_RSHIFT( X[ 0 ][ decimated_framelength - 1 ], 1 );
+        HPstateTmp = X[ 0 ][ decimated_framelength - 1 ];
+        for( i = decimated_framelength - 1; i > 0; i-- )
+        {
+            X[ 0 ][ i - 1 ] = (short)SKP_RSHIFT( X[ 0 ][ i - 1 ], 1 );
+            X[ 0 ][ i ] -= X[ 0 ][ i - 1 ];
+        }
+        X[ 0 ][ 0 ] -= psSilk_VAD.HPstate;
+        psSilk_VAD.HPstate = HPstateTmp;
+
+        /*************************************/
+        /* Calculate the energy in each band */
+        /*************************************/
+        for( b = 0; b < VAD_N_BANDS; b++ )
+        {
+            /* Find the decimated framelength in the non-uniformly divided bands */
+            decimated_framelength = SKP_RSHIFT( framelength, SKP_min_int( VAD_N_BANDS - b, VAD_N_BANDS - 1 ) );
+
+            /* Split length into subframe lengths */
+            dec_subframe_length = SKP_RSHIFT( decimated_framelength, VAD_INTERNAL_SUBFRAMES_LOG2 );
+            dec_subframe_offset = 0;
+
+            /* Compute energy per sub-frame */
+            /* initialize with summed energy of last subframe */
+            Xnrg[ b ] = psSilk_VAD.XnrgSubfr[ b ];
+            for( s = 0; s < VAD_INTERNAL_SUBFRAMES; s++ )
+            {
+                sumSquared = 0;
+                for( i = 0; i < dec_subframe_length; i++ )
+                {
+                    /* The energy will be less than dec_subframe_length * ( SKP_int16_MIN / 8 ) ^ 2.            */
+                    /* Therefore we can accumulate with no risk of overflow (unless dec_subframe_length > 128)  */
+                    x_tmp = SKP_RSHIFT( X[ b ][ i + dec_subframe_offset ], 3 );
+                    sumSquared = SKP_SMLABB( sumSquared, x_tmp, x_tmp );
+                }
+
+                /* Add/saturate summed energy of current subframe */
+                if( s < VAD_INTERNAL_SUBFRAMES - 1 )
+                {
+                    Xnrg[ b ] = SKP_ADD_POS_SAT32( Xnrg[ b ], sumSquared );
+                }
+                else
+                {
+                    /* Look-ahead subframe */
+                    Xnrg[ b ] = SKP_ADD_POS_SAT32( Xnrg[ b ], SKP_RSHIFT( sumSquared, 1 ) );
+                }
+
+                dec_subframe_offset += dec_subframe_length;
+            }
+            psSilk_VAD.XnrgSubfr[ b ] = sumSquared;
+        }
+
+        /********************/
+        /* Noise estimation */
+        /********************/
+        SKP_Silk_VAD_GetNoiseLevels( Xnrg, 0, psSilk_VAD );
+
+        /***********************************************/
+        /* Signal-plus-noise to noise ratio estimation */
+        /***********************************************/
+        sumSquared = 0;
+        input_tilt = 0;
+        for( b = 0; b < VAD_N_BANDS; b++ )
+        {
+            speech_nrg = Xnrg[ b ] - psSilk_VAD.NL[ b ];
+            if( speech_nrg > 0 )
+            {
+                /* Divide, with sufficient resolution */
+                if( ( Xnrg[ b ] & 0xFF800000 ) == 0 )
+                {
+                    NrgToNoiseRatio_Q8[ b ] = SKP_DIV32( SKP_LSHIFT( Xnrg[ b ], 8 ), psSilk_VAD.NL[ b ] + 1 );
+                }
+                else
+                {
+                    NrgToNoiseRatio_Q8[ b ] = SKP_DIV32( Xnrg[ b ], SKP_RSHIFT( psSilk_VAD.NL[ b ], 8 ) + 1 );
+                }
+
+                /* Convert to log domain */
+                SNR_Q7 = SKP_Silk_lin2log( NrgToNoiseRatio_Q8[ b ] ) - 8 * 128;
+
+                /* Sum-of-squares */
+                sumSquared = SKP_SMLABB( sumSquared, SNR_Q7, SNR_Q7 );          /* Q14 */
+
+                /* Tilt measure */
+                if( speech_nrg < ( 1 << 20 ) )
+                {
+                    /* Scale down SNR value for small subband speech energies */
+                    SNR_Q7 = SKP_SMULWB( SKP_LSHIFT( SKP_Silk_SQRT_APPROX( speech_nrg ), 6 ), SNR_Q7 );
+                }
+                input_tilt = SKP_SMLAWB( input_tilt, tiltWeights[ b ], SNR_Q7 );
+            }
+            else
+            {
+                NrgToNoiseRatio_Q8[ b ] = 256;
+            }
+        }
+
+        /* Mean-of-squares */
+        sumSquared = SKP_DIV32_16( sumSquared, VAD_N_BANDS ); /* Q14 */
+
+        /* Root-mean-square approximation, scale to dBs, and write to output pointer */
+        pSNR_dB_Q7 = (short)( 3 * SKP_Silk_SQRT_APPROX( sumSquared ) );  /* Q7 */
+
+        /*********************************/
+        /* Speech Probability Estimation */
+        /*********************************/
+        SA_Q15 = SKP_Silk_sigm_Q15( SKP_SMULWB( VAD_SNR_FACTOR_Q16, pSNR_dB_Q7 ) - VAD_NEGATIVE_OFFSET_Q5 );
+
+        /**************************/
+        /* Frequency Tilt Measure */
+        /**************************/
+        pTilt_Q15 = SKP_LSHIFT( SKP_Silk_sigm_Q15( input_tilt ) - 16384, 1 );
+
+        /**************************************************/
+        /* Scale the sigmoid output based on power levels */
+        /**************************************************/
+        speech_nrg = 0;
+        for( b = 0; b < VAD_N_BANDS; b++ )
+        {
+            /* Accumulate signal-without-noise energies, higher frequency bands have more weight */
+            speech_nrg += ( b + 1 ) * SKP_RSHIFT( Xnrg[ b ] - psSilk_VAD.NL[ b ], 4 );
+        }
+
+        /* Power scaling */
+        if( speech_nrg <= 0 )
+        {
+            SA_Q15 = SKP_RSHIFT( SA_Q15, 1 );
+        }
+        else if( speech_nrg < 32768 )
+        {
+            /* square-root */
+            speech_nrg = SKP_Silk_SQRT_APPROX( SKP_LSHIFT( speech_nrg, 15 ) );
+            SA_Q15 = SKP_SMULWB( 32768 + speech_nrg, SA_Q15 );
+        }
+
+        /* Copy the resulting speech activity in Q8 to *pSA_Q8 */
+        pSA_Q8 = SKP_min_int( SKP_RSHIFT( SA_Q15, 7 ), 255 /* SKP_uint8_MAX */ );
+
+        /***********************************/
+        /* Energy Level and SNR estimation */
+        /***********************************/
+        /* Smoothing coefficient */
+        smooth_coef_Q16 = SKP_SMULWB( VAD_SNR_SMOOTH_COEF_Q18, SKP_SMULWB( SA_Q15, SA_Q15 ) );
+        for( b = 0; b < VAD_N_BANDS; b++ )
+        {
+            /* compute smoothed energy-to-noise ratio per band */
+            psSilk_VAD.NrgRatioSmth_Q8[ b ] = SKP_SMLAWB( psSilk_VAD.NrgRatioSmth_Q8[ b ],
+                NrgToNoiseRatio_Q8[ b ] - psSilk_VAD.NrgRatioSmth_Q8[ b ], smooth_coef_Q16 );
+
+            /* signal to noise ratio in dB per band */
+            SNR_Q7 = 3 * ( SKP_Silk_lin2log( psSilk_VAD.NrgRatioSmth_Q8[ b ] ) - 8 * 128 );
+            /* quality = sigmoid( 0.25 * ( SNR_dB - 16 ) ); */
+            pQuality_Q15[ pQuality_Q15Off + b ] = SKP_Silk_sigm_Q15( SKP_RSHIFT( SNR_Q7 - 16 * 128, 4 ) );
+        }
+
+        return ret;
+    }
+
+    /**************************/
+    /* Noise level estimation */
+    /**************************/
+    public static void SKP_Silk_VAD_GetNoiseLevels(
+        int[] pX, int pXOff,                       /* I    subband energies                            */
+        SKP_Silk_VAD_state psSilk_VAD              /* I/O  Pointer to Silk VAD state                   */
+        )
+    {
+        int k;
+        int nl, nrg, inv_nrg;
+        int coef, min_coef;
+
+        /* Initially faster smoothing */
+        if( psSilk_VAD.counter < 1000 )             /* 1000 = 20 sec */
+        {
+            min_coef = SKP_DIV32_16( short.MaxValue /* SKP_int16_MAX */, SKP_RSHIFT( psSilk_VAD.counter, 4 ) + 1 );
+        }
+        else
+        {
+            min_coef = 0;
+        }
+
+        for( k = 0; k < VAD_N_BANDS; k++ )
+        {
+            /* Get old noise level estimate for current band */
+            nl = psSilk_VAD.NL[ k ];
+
+            /* Add bias */
+            nrg = SKP_ADD_POS_SAT32( pX[ pXOff + k ], psSilk_VAD.NoiseLevelBias[ k ] );
+
+            /* Invert energies */
+            inv_nrg = SKP_DIV32( int.MaxValue /* SKP_int32_MAX */, nrg );
+
+            /* Less update when subband energy is high */
+            if( nrg > SKP_LSHIFT( nl, 3 ) )
+            {
+                coef = VAD_NOISE_LEVEL_SMOOTH_COEF_Q16 >> 3;
+            }
+            else if( nrg < nl )
+            {
+                coef = VAD_NOISE_LEVEL_SMOOTH_COEF_Q16;
+            }
+            else
+            {
+                coef = SKP_SMULWB( SKP_SMULWW( inv_nrg, nl ), VAD_NOISE_LEVEL_SMOOTH_COEF_Q16 << 1 );
+            }
+
+            /* Initially faster smoothing */
+            coef = SKP_max_int( coef, min_coef );
+
+            /* Smooth inverse energies */
+            psSilk_VAD.inv_NL[ k ] = SKP_SMLAWB( psSilk_VAD.inv_NL[ k ], inv_nrg - psSilk_VAD.inv_NL[ k ], coef );
+
+            /* Compute noise level by inverting again */
+            nl = SKP_DIV32( int.MaxValue /* SKP_int32_MAX */, psSilk_VAD.inv_NL[ k ] );
+
+            /* Limit noise levels (guarantee 7 bits of head room) */
+            nl = SKP_min( nl, 0x00FFFFFF );
+
+            /* Store as part of state */
+            psSilk_VAD.NL[ k ] = nl;
+        }
+
+        /* Increment frame counter */
+        psSilk_VAD.counter++;
+    }
+}

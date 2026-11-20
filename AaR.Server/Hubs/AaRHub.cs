@@ -35,10 +35,13 @@ public class AaRHub : Hub
             Context.Abort();
             return Task.CompletedTask;
         }
+        // L4v1：握手短身份（头优先 → query 兜底，docs/l4-contract-v1.md §1.2）；
+        // 全缺 = legacy 单桥连接（今日 JS 桥 0.4.x）
+        var identity = BridgeIdentity.FromContext(ctx);
         var prev = _registry.PreviousBridge;
-        _registry.SetBridge(Context.ConnectionId);
-        // single-bridge policy: kick a stale previous connection if still attached
-        if (!string.IsNullOrEmpty(prev) && prev != Context.ConnectionId)
+        _registry.SetBridge(Context.ConnectionId, identity);
+        // legacy 路径保留单桥踢旧语义；身份槽之间不互踢（同 uin 顶替在 hello 绑定时处理）
+        if (identity is null && !string.IsNullOrEmpty(prev) && prev != Context.ConnectionId)
         {
             _ = Groups.RemoveFromGroupAsync(prev, "aar-bridge");
             try { Clients.Client(prev).SendAsync("InternalLog", "warn", "replaced by a newer bridge connection"); }
@@ -61,6 +64,19 @@ public class AaRHub : Hub
 
     public async Task InternalEvent(string name, string payloadJson)
     {
+        // L4v1 hello 保留名（docs/l4-contract-v1.md §1.2 时点二）：桥自报能力/uin/代际。
+        // 注册表返回被同 uin 顶替的旧连接，由 hub 踢（与 legacy 踢旧同款动作）。
+        if (name == "hello")
+        {
+            var displaced = _registry.Hello(Context.ConnectionId, payloadJson);
+            if (!string.IsNullOrEmpty(displaced) && displaced != Context.ConnectionId)
+            {
+                _ = Groups.RemoveFromGroupAsync(displaced, "aar-bridge");
+                try { await Clients.Client(displaced).SendAsync("InternalLog", "warn", "replaced by a newer connection for the same account"); }
+                catch { }
+            }
+            return;
+        }
         _logger.LogInformation("[event] {Name} ({Len} bytes)", name, payloadJson.Length);
         await _ob11.OnInternalEventAsync(name, payloadJson);
     }

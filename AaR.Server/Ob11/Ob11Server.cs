@@ -1109,6 +1109,16 @@ public class Ob11Server
 
     public async Task<Ob11Response> HandleActionAsync(string action, Dictionary<string, object?> p, string? echo, JsonElement? echoRaw)
     {
+        // L4v1 能力守卫（docs/l4-contract-v1.md §3.3/§6）：hello 申报过能力的槽不含本动作所需
+        // 扩展组 → 显式降级（retcode 1200 + wording）；legacy/pending 槽按满能力假定放行。
+        // _async / _rate_limited 后缀先剥离再查表（守卫先于异步化，失败响应即时返回）。
+        var guardAction = action;
+        if (guardAction.EndsWith("_async", StringComparison.Ordinal)) guardAction = guardAction[..^6];
+        else if (guardAction.EndsWith("_rate_limited", StringComparison.Ordinal)) guardAction = guardAction[..^13];
+        var missingExt = _bridge.MissingCapability(guardAction);
+        if (missingExt is not null)
+            return Ob11Response.Fail(Ob11.RetUnsupported, "bridge capability missing: " + missingExt, echo: echo, echoRaw: echoRaw);
+
         // 标准：所有 API 都支持 _async / _rate_limited 后缀——后台执行，立即返回 async
         if (action.EndsWith("_async", StringComparison.Ordinal) || action.EndsWith("_rate_limited", StringComparison.Ordinal))
         {

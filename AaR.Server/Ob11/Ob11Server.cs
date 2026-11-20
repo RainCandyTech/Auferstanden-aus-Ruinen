@@ -23,7 +23,7 @@ public class Ob11Server
     public volatile string SelfNick = "";
 
     /// <summary>Server version reported by get_version_info and the #AaR debug command.</summary>
-    public const string ServerVersion = "0.6.0";
+    public const string ServerVersion = "0.7.0";
 
     // msgId -> "chatType|peerUid|seq" for delete_msg / get_msg / reply building
     private readonly ConcurrentDictionary<string, string> _msgIndex = new();

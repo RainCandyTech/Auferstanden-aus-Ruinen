@@ -253,4 +253,15 @@ public sealed class BridgeRegistry
             ? null
             : required;
     }
+
+    /// <summary>缺省路由桥描述（#AaR 横幅用）：类型 / 申报版本（legacy 未申报 = null）/ 契约核心。</summary>
+    public (string Bridge, string? Version, string Core)? DescribeTargetBridge()
+    {
+        var conn = ResolveTarget(null);
+        if (conn is null) return null;
+        if (conn == _legacyConnectionId) return ("js", null, "v1");   // legacy 通道无申报
+        if (_slots.TryGetValue(conn, out var s))
+            return (s.Bridge, s.Version.Length > 0 ? s.Version : null, s.Core);
+        return null;
+    }
 }

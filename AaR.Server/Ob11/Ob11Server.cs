@@ -902,11 +902,27 @@ public class Ob11Server
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine($"项目代号\"{_opts.ProjectCodename}\"，{_opts.DeploymentLabel}");
-        sb.AppendLine($"版本{ServerVersion}");
+        sb.AppendLine($"版本 {ServerVersion}");
         sb.AppendLine($"平台{PlatformString()}");
         sb.AppendLine($"运行时间{UptimeHoursMinutes(DateTime.UtcNow - _startedAt)}");
-        sb.AppendLine($".NET{Environment.Version}/QQ {ResolveQQVersion()}");
-        sb.Append("SignalR-JSRPC模式");
+        sb.AppendLine($".NET {Environment.Version}/QQ {ResolveQQVersion()}");
+        // 0.7.0：报缺省路由桥的申报身份（l4-contract-v1.md §1.2）——legacy 通道无申报。
+        var bridge = _bridge.DescribeTargetBridge();
+        if (bridge is null)
+        {
+            sb.Append("SignalR（桥未连接）");
+        }
+        else
+        {
+            var typeName = bridge.Value.Bridge switch
+            {
+                "js" => "JS桥接器",
+                "native" => "Native桥接器",
+                _ => bridge.Value.Bridge + "桥接器",
+            };
+            sb.Append($"SignalR / 协议 {bridge.Value.Core} / {typeName}" +
+                (bridge.Value.Version is { Length: > 0 } v ? $" {v}" : "（legacy 未申报）"));
+        }
         return sb.ToString();
     }
 
@@ -926,7 +942,8 @@ public class Ob11Server
             sb.AppendLine($"uptime      : session {FormatUptime(DateTime.UtcNow - _startedAt)} / process {FormatUptime(DateTime.Now - proc.StartTime)}");
             sb.AppendLine($"memory      : working set {proc.WorkingSet64 / 1024 / 1024} MB, GC heap {GC.GetTotalMemory(false) / 1024 / 1024} MB, threads {proc.Threads.Count}");
             sb.AppendLine($"self        : uin={SelfUin} uid={SelfUid} nick={SelfNick}");
-            sb.AppendLine($"bridge      : {(_bridge.IsBridgeConnected ? "connected" : "NOT connected")}");
+            sb.AppendLine($"bridge      : {(_bridge.IsBridgeConnected ? "connected" : "NOT connected")}" +
+                (_bridge.DescribeTargetBridge() is { } db ? $" ({db.Bridge} v={db.Version ?? "-"} core={db.Core})" : ""));
             sb.AppendLine($"auth        : token {(string.IsNullOrEmpty(_opts.AccessToken) ? "NOT set (auth disabled)" : $"set ({_opts.AccessToken.Length} chars)")}");
             sb.AppendLine($"endpoints   : hub={_opts.BridgeHubPath} ws={_opts.Ob11WsPath}");
             sb.AppendLine($"flags       : RequireBridgeForHttp={_opts.RequireBridgeForHttp} EnableDebugKernel={_opts.EnableDebugKernel} EnableDebugCommand={_opts.EnableDebugCommand}");

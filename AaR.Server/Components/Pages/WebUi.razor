@@ -136,6 +136,7 @@ else
             return;
         }
         try { _procStart = System.Diagnostics.Process.GetCurrentProcess().StartTime; } catch { }
+        Load();   // 首帧即有数据（SSR 快照完整）；后续由 PeriodicTimer 驱动
         _ = RefreshLoopAsync();
     }
 

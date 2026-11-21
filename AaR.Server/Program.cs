@@ -157,6 +157,9 @@ app.Use(next => ctx => wsMiddleware.InvokeAsync(ctx, next));
 app.MapHub<AaRHub>(opts.BridgeHubPath);
 
 // ---------- WebUI 管理面板（/ui）----------
+// 静态资产端点（net9+ 形态）：wwwroot/_content（FluentUI css/组件 js）+
+// 框架资产（blazor.web.js）——缺它则 404 双断供（CSS 裸奔 + 电路不起）
+app.MapStaticAssets();
 app.MapRazorComponents<App>().AddInteractiveServerRenderMode();
 
 app.Run();

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <base href="/" />
+    <title>AaR WebUI</title>
+    <link href="_content/Microsoft.FluentUI.AspNetCore.Components/Microsoft.FluentUI.AspNetCore.Components.bundle.scp.css" rel="stylesheet" />
+    <style>
+        /* 面板补充样式（Fluent 体系之外的最小增补） */
+        .wrap { max-width: 1020px; margin: 0 auto; padding: 28px 20px 60px; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; margin: 16px 0 22px; }
+        .stat { display: flex; flex-direction: column; gap: 2px; padding: 14px 16px; }
+        .stat .k { font-size: 11px; opacity: .7; text-transform: uppercase; letter-spacing: 1px; }
+        .stat .v { font-size: 18px; font-weight: 600; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 9px 12px; text-align: left; font-size: 13px; border-bottom: 1px solid var(--neutral-stroke-rest); }
+        th { opacity: .7; font-weight: 500; font-size: 11px; letter-spacing: 1px; }
+        tr:last-child td { border-bottom: none; }
+        .qr { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; margin-top: 12px; }
+        .qrbox { background: #fff; padding: 10px; border-radius: 8px; }
+        .qrbox img { display: block; width: 200px; height: 200px; }
+        .qrmeta { font-size: 12px; opacity: .8; max-width: 360px; word-break: break-all; }
+        h1 { font-size: 18px; margin: 0; letter-spacing: .5px; }
+        h2 { font-size: 13px; opacity: .7; letter-spacing: 1px; margin: 24px 0 10px; }
+        .sub { font-size: 12px; opacity: .6; margin: 4px 0 0; }
+    </style>
+</head>
+<body data-theme="dark">
+    <Routes />
+    <script src="_framework/blazor.web.js"></script>
+</body>
+</html>

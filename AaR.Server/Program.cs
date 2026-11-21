@@ -1,9 +1,11 @@
 using AaR.Server;
+using AaR.Server.Components;
 using AaR.Server.Services;
 using AaR.Server.Hubs;
 using AaR.Server.Middleware;
 using AaR.Server.Ob11;
 using AaR.Server.Storage;
+using Microsoft.FluentUI.AspNetCore.Components;
 using System.Text;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -29,6 +31,10 @@ builder.Services.Configure<Microsoft.AspNetCore.SignalR.HubOptions>(o =>
     o.MaximumReceiveMessageSize = 4 * 1024 * 1024;
     o.MaximumParallelInvocationsPerClient = 10;
 });
+
+// ---------- WebUI 管理面板（1.0.0-preview1 里程碑）：Blazor Interactive Server + FluentUI ----------
+builder.Services.AddRazorComponents().AddInteractiveServerComponents();
+builder.Services.AddFluentUIComponents();
 
 var app = builder.Build();
 
@@ -139,5 +145,8 @@ app.Use(next => ctx => wsMiddleware.InvokeAsync(ctx, next));
 
 // ---------- SignalR hub for the bridge ----------
 app.MapHub<AaRHub>(opts.BridgeHubPath);
+
+// ---------- WebUI 管理面板（/ui）----------
+app.MapRazorComponents<App>().AddInteractiveServerRenderMode();
 
 app.Run();

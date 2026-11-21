@@ -45,6 +45,11 @@ public sealed class BridgeSlot
     public long Gen;                     // 该连接会话代际
     public bool HelloSeen;               // hello 到达后守卫才生效（之前按满能力假定）
     public readonly HashSet<string> Ext = new(StringComparer.Ordinal);
+
+    // 1.0.0-preview1 WebUI：headless 登录面的透出缓存（pending 槽的扫码状态）
+    public string? LoginQrUrl;
+    public string? LoginQrPng;           // base64 PNG（无图则仅链接）
+    public DateTime LoginQrAt;
 }
 
 /// <summary>
@@ -132,6 +137,9 @@ public sealed class BridgeRegistry
             if (root.TryGetProperty("uin", out var u) && u.GetString() is { Length: > 0 } uin)
             {
                 slot.Uin = uin;
+                // 1.0.0-preview1：绑定即清登录面缓存（QR 卡片在 WebUI 上转正为槽位行）
+                slot.LoginQrUrl = null;
+                slot.LoginQrPng = null;
                 var existing = _byUin.GetOrAdd(uin, connectionId);
                 if (existing != connectionId && _byUin.TryUpdate(uin, connectionId, existing))
                 {
@@ -260,6 +268,52 @@ public sealed class BridgeRegistry
     public string? UinOfConnection(string connectionId)
     {
         return _slots.TryGetValue(connectionId, out var s) && !string.IsNullOrEmpty(s.Uin) ? s.Uin : null;
+    }
+
+    /// <summary>1.0.0-preview1：headless 桥经 InternalEvent("login_qr") 透出的扫码面缓存。
+    /// pending 槽的登录 QR 由 WebUI 展示；hello 绑定时清除（见 Hello()）。</summary>
+    public void SetLoginQr(string connectionId, string url, string? pngBase64)
+    {
+        if (!_slots.TryGetValue(connectionId, out var slot)) return;
+        slot.LoginQrUrl = url;
+        slot.LoginQrPng = pngBase64;
+        slot.LoginQrAt = DateTime.UtcNow;
+        _logger.LogInformation("bridge login_qr: {Conn} slot={Slot} url={Url}", connectionId, slot.Slot, url);
+    }
+
+    /// <summary>1.0.0-preview1：WebUI 总览面——全部在线槽（legacy/pending/bound）+ 登录 QR 缓存。</summary>
+    public List<Dictionary<string, object?>> DescribeOverview()
+    {
+        var outv = new List<Dictionary<string, object?>>();
+        if (_legacyConnectionId is { Length: > 0 })
+            outv.Add(new Dictionary<string, object?>
+            {
+                ["state"] = "legacy",
+                ["bridge"] = "js",
+                ["version"] = "",
+                ["slot"] = "-",
+                ["uin"] = null,
+                ["qr_url"] = null,
+                ["qr_png"] = null,
+                ["qr_at"] = null,
+            });
+        foreach (var kv in _slots)
+        {
+            var s = kv.Value;
+            outv.Add(new Dictionary<string, object?>
+            {
+                ["state"] = s.HelloSeen ? "bound" : "pending",
+                ["bridge"] = s.Bridge,
+                ["version"] = s.Version,
+                ["slot"] = s.Slot,
+                ["uin"] = s.Uin,
+                ["qr_url"] = s.LoginQrUrl,
+                ["qr_png"] = s.LoginQrPng,
+                ["qr_at"] = s.LoginQrAt == default ? null : s.LoginQrAt.ToString("yyyy-MM-dd HH:mm:ss"),
+            });
+        }
+        outv.Sort((a, b) => string.CompareOrdinal(a["state"]?.ToString() ?? "", b["state"]?.ToString() ?? ""));
+        return outv;
     }
 
     /// <summary>0.8.1：注册表全槽清单（#AaR 横幅多账号可观测）——hello 绑定过的槽，uin 升序。</summary>

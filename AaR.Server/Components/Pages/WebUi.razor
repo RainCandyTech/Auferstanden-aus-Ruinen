@@ -1,0 +1,159 @@
+@page "/ui"
+@rendermode InteractiveServer
+@using System.Web
+@inject BridgeRegistry Registry
+@inject AaROptions Opts
+@inject NavigationManager Nav
+
+@if (_authFailed)
+{
+    <div class="wrap">
+        <FluentCard>
+            <div style="padding:24px;text-align:center;">
+                403 · access token 无效——请在 URL 上携带 <code>?access_token=&lt;token&gt;</code>
+            </div>
+        </FluentCard>
+    </div>
+}
+else
+{
+    <div class="wrap">
+        <h1>AaR WebUI <span style="opacity:.5;font-weight:400">@Ob11Server.ServerVersion</span></h1>
+        <p class="sub">管理面板 · 每 2 秒自动刷新 · Fluent UI</p>
+
+        <div class="stats">
+            <FluentCard Class="stat">
+                <span class="k">桥接状态</span>
+                <span class="v" style="color:@(Registry.IsBridgeConnected ? "var(--accent-fill-rest)" : "var(--error)")">
+                    @(Registry.IsBridgeConnected ? "已连接" : "未连接")
+                </span>
+            </FluentCard>
+            <FluentCard Class="stat">
+                <span class="k">在线槽位</span>
+                <span class="v">@_overview.Count</span>
+            </FluentCard>
+            <FluentCard Class="stat">
+                <span class="k">已绑账号</span>
+                <span class="v">@_boundCount</span>
+            </FluentCard>
+            <FluentCard Class="stat">
+                <span class="k">运行时长</span>
+                <span class="v">@_uptime</span>
+            </FluentCard>
+        </div>
+
+        <h2>槽位</h2>
+        @if (_overview.Count == 0)
+        {
+            <FluentCard>
+                <div style="padding:18px;text-align:center;opacity:.6;">
+                    无在线槽位——headless 桥（run-headless.sh）或挂机桥启动后即在此显示
+                </div>
+            </FluentCard>
+        }
+        else
+        {
+            <FluentCard Style="padding:4px;">
+                <table>
+                    <thead>
+                        <tr><th>状态</th><th>桥型</th><th>版本</th><th>槽</th><th>账号</th></tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var s in _overview)
+                        {
+                            var state = s["state"] as string ?? "";
+                            <tr>
+                                <td>
+                                    <span class="pill" style="color:@(state == "bound" ? "var(--accent-fill-rest)" : state == "pending" ? "var(--warning)" : "var(--neutral-foreground-rest)");">
+                                        @state
+                                    </span>
+                                </td>
+                                <td>@s["bridge"]</td>
+                                <td>@(string.IsNullOrEmpty(s["version"] as string) ? "-" : s["version"])</td>
+                                <td>@(string.IsNullOrEmpty(s["slot"] as string) ? "-" : s["slot"])</td>
+                                <td>@(s["uin"] is string uin && uin.Length > 0 ? uin : "-")</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </FluentCard>
+        }
+
+        @{
+            var pending = _overview.Where(s => s["state"] as string == "pending" && !string.IsNullOrEmpty(s["qr_url"] as string)).ToList();
+        }
+        @if (pending.Count > 0)
+        {
+            <h2>待扫码登录</h2>
+            <FluentCard>
+                <div style="padding:16px;">
+                    <div class="qr">
+                        @foreach (var p in pending)
+                        {
+                            <div class="qrbox">
+                                @if (p["qr_png"] is string png && png.Length > 0)
+                                {
+                                    <img src="data:image/png;base64,@png" alt="登录二维码" />
+                                }
+                                else
+                                {
+                                    <div style="width:200px;height:200px;display:flex;align-items:center;justify-content:center;color:#333;">
+                                        无码图
+                                    </div>
+                                }
+                            </div>
+                            <div class="qrmeta">
+                                <div>更新于 @p["qr_at"]</div>
+                                <div style="margin-top:8px;">
+                                    <FluentAnchor Href="@(p["qr_url"] as string)" Target="_blank">在浏览器打开二维码链接</FluentAnchor>
+                                </div>
+                                <div style="margin-top:8px;word-break:break-all;">@(p["qr_url"])</div>
+                            </div>
+                        }
+                    </div>
+                </div>
+            </FluentCard>
+        }
+    </div>
+}
+
+@code {
+    private bool _authFailed;
+    private List<Dictionary<string, object?>> _overview = new();
+    private int _boundCount;
+    private string _uptime = "-";
+    private DateTime _procStart = DateTime.Now;
+    private PeriodicTimer? _timer;
+
+    protected override void OnInitialized()
+    {
+        // 鉴权：服务端配置 AccessToken 时要求 ?access_token=（与 OB11 HTTP 同口径）
+        var q = HttpUtility.ParseQueryString(new Uri(Nav.Uri).Query);
+        var token = q["access_token"] ?? "";
+        if (!string.IsNullOrEmpty(Opts.AccessToken) && token != Opts.AccessToken)
+        {
+            _authFailed = true;
+            return;
+        }
+        try { _procStart = System.Diagnostics.Process.GetCurrentProcess().StartTime; } catch { }
+        _ = RefreshLoopAsync();
+    }
+
+    private async Task RefreshLoopAsync()
+    {
+        _timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
+        while (await _timer.WaitForNextTickAsync())
+        {
+            Load();
+            StateHasChanged();
+        }
+    }
+
+    private void Load()
+    {
+        _overview = Registry.DescribeOverview();
+        _boundCount = _overview.Count(s => s["state"] as string == "bound");
+        var up = DateTime.Now - _procStart;
+        _uptime = up.TotalHours >= 1 ? $"{(int)up.TotalHours} 时 {up.Minutes} 分" : $"{up.Minutes} 分 {up.Seconds} 秒";
+    }
+}

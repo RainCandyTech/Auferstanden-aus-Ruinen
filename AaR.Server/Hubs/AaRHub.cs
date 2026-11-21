@@ -77,6 +77,20 @@ public class AaRHub : Hub
             }
             return;
         }
+        // 1.0.0-preview1：headless 桥的登录面透出（WebUI 扫码卡片）——
+        // 事件名与 hello 同级的桥管理面（内核事件面不经过此分支）
+        if (name == "login_qr")
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(payloadJson);
+                var url = doc.RootElement.TryGetProperty("url", out var u) ? u.GetString() : null;
+                var png = doc.RootElement.TryGetProperty("pngBase64", out var p) ? p.GetString() : null;
+                if (!string.IsNullOrEmpty(url)) _registry.SetLoginQr(Context.ConnectionId, url, png);
+            }
+            catch (JsonException) { /* 桥侧负载异常不落日志面 */ }
+            return;
+        }
         _logger.LogInformation("[event] {Name} ({Len} bytes) slot={Uin}", name, payloadJson.Length,
             _registry.UinOfConnection(Context.ConnectionId) ?? "-");
         await _ob11.OnInternalEventAsync(name, payloadJson, _registry.UinOfConnection(Context.ConnectionId));

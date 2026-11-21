@@ -57,7 +57,7 @@ AaR 是面向 **QQ NT Linux 客户端（3.2.x）** 的 OneBot v11 协议端实�
 |---|---|---|
 | **AaR.Server** | .NET 二进制 | OneBot v11 协议端本体：全部协议逻辑、传输通道、事件转换、对外接口 |
 | **JS 桥** | JavaScript（**0.4.1 起明文分发**） | 运行于 QQ NT 主进程内部，**仅**将 RPC 调用转换为客户端内核函数调用、推送内核事件。不含任何协议逻辑 |
-| **Native Hook 桥** ⚠️ 实验性 | C++ / LD_PRELOAD（0.4.1 新增） | 同上职责的零 JS 注入形态：GOT 补丁截获 wrapper.node 的 NAPI 调用直驱内核。**预览形态**——长稳回归与部署工具化未完成，生产环境仍以 JS 桥为准 |
+| **Native 桥** ⚠️ 预研中 | .NET host + 进程内原语（L4 契约） | 零 JS 依赖的桥接形态：契约规范见 `docs/l4-contract-v1.md`（core-v1 + 扩展组 + 多账号槽位），host 骨架与发送原语预研推进中。**Native 发送路径待验证**——生产环境以 JS 桥为准 |
 
 协议端与桥接模块之间通过 SignalR 双向 RPC 通信。桥接模块对协议一无所知——
 这一隔离是刻意设计的。JS 桥自 0.4.1 起以明文分发（此前为混淆分发）；
@@ -68,7 +68,25 @@ AaR 是面向 **QQ NT Linux 客户端（3.2.x）** 的 OneBot v11 协议端实�
 - Linux x64（Debian/Ubuntu 系实测）
 - QQ NT 3.2.x（官方 deb）
 - .NET 11 运行时（`dotnet-runtime-11.0`）
-- 一个已登录的 QQ NT 会话
+- 一个或多个已登录的 QQ NT 会话（**多账号 = QQ 多开**，每账号一个 QQ 进程——见下文「多账号」）
+
+## 多账号（v0.8.x）
+
+QQ NT Linux 的多账号形态是**多进程**（每账号一个 QQ 进程，各持自己的 NT
+会话）。AaR 对此的完整语义：
+
+1. **桥自动上线**：QQ 多开后，每个进程内的桥实例自动捕获自己的会话并
+   以独立连接上线，服务端按账号（hello uin）分槽——无需任何多账号配置；
+2. **`self_id` 路由**：OB11 调用（HTTP/WS）带 `self_id` 参数即以该账号
+   执行（`send_group_msg`、`get_login_info` 等）；**缺省 = 主槽**（首个
+   绑定的账号），单账号用户零感知；
+3. **事件正身**：每个账号的事件以该账号的 `self_id` 上报（多账号同群
+   收发时两条事件各盖各的身份）；
+4. **反向 WS 一 bot 一连接**（v0.8.1）：`Reverse.WebSockets` 的每个目标
+   可用 `"selfId"` 绑定账号——该连接只收该账号的事件，其回传的 API
+   调用默认路由到绑定账号。未绑定的目标保持全量推送（兼容行为）；
+5. **正向 WS 多 bot**：不做专门处理——事件已带 `self_id`，客户端按
+   `self_id` 自行分流。
 
 ## OneBot v11 接口面
 
@@ -78,7 +96,7 @@ AaR 是面向 **QQ NT Linux 客户端（3.2.x）** 的 OneBot v11 协议端实�
 |---|---|---|
 | 正向 HTTP | 框架 → AaR | `POST /api/{action}`，兼容 `POST /{action}` 与 GET 查询串 |
 | 正向 WebSocket | 框架 ↔ AaR | `/ws`，事件直推 + 同连接 API 调用，连接即补发 `lifecycle connect` |
-| 反向 WebSocket | AaR → 框架 | AaR 作为 WS 客户端连出，携带 `X-Self-ID` / `X-Client-Role` 头，同连接双向 |
+| 反向 WebSocket | AaR → 框架 | AaR 作为 WS 客户端连出，携带 `X-Self-ID` / `X-Client-Role` 头，同连接双向；v0.8.1 起目标可用 `selfId` 绑定账号（一 bot 一连接，事件过滤 + 回传 API 按绑定账号路由） |
 | 反向 HTTP POST | AaR → 框架 | 事件上报（`X-Self-ID` 头），上游 2xx 响应体可携带 API 调用数组，AaR 执行 |
 
 ### 已实现 action
@@ -138,9 +156,16 @@ AaR.Server 读取同目录 `appsettings.json` 的 `AaR` 段：
     "RequireBridgeForHttp": true,   // 桥接未连接时 HTTP API 返回 503（不再是无用的死配置）
     "EnableDebugCommand": true,     // #AaR 聊天调试命令（见下文）；设为 false 可关闭
     "EnableDebugKernel": false,     // debug_kernel 诊断透传（默认关闭）
+    "Storage": {                    // 消息/媒体/uid 索引持久化（v0.5.0 起）
+      "Provider": "sqlite",
+      "Path": "data/aar.db"
+    },
     "Reverse": {
       "WebSockets": [               // 反向 WS 目标（框架侧 WS 服务地址）
-        { "Url": "ws://127.0.0.1:8080/onebot/v11/ws", "AccessToken": "" }
+        // v0.8.1：多 bot 一 bot 一连接——selfId 绑定账号后该连接只收该账号
+        // 事件、回传 API 默认路由绑定账号；省略 selfId = 全量（兼容）
+        { "Url": "ws://127.0.0.1:8080/onebot/v11/ws", "AccessToken": "", "SelfId": "3774879303" },
+        { "Url": "ws://127.0.0.1:8081/onebot/v11/ws", "AccessToken": "", "SelfId": "2074696141" }
       ],
       "HttpPost": [                 // 反向 HTTP 上报目标
         { "Url": "http://127.0.0.1:8080/onebot/v11/report", "AccessToken": "" }
@@ -163,8 +188,8 @@ AaR.Server 读取同目录 `appsettings.json` 的 `AaR` 段：
 - 所有 id 均掩码显示（如 `****7890`），不包含任何 uid/uin/URL/令牌
 
 同时完整（未脱敏）诊断信息——运行时、内存、进程、自我身份、端点配置、
-反向目标、索引明细——只写入服务端日志（`#AaR debug command` 条目），
-聊天侧不可见。
+反向目标、索引明细、**多账号槽位清单（v0.8.1 起的 `slots:` 行）**——只写入
+服务端日志（`#AaR debug command` 条目），聊天侧不可见。
 
 - 同一会话 5 秒内重复触发会被静默忽略（防刷屏/防回环）
 - 触发消息本身照常向框架广播，机器人自己的消息不会触发
@@ -184,6 +209,9 @@ Native Hook 桥（实验性）以 `LD_PRELOAD` 方式注入 QQ 主进程，与 J
 ## 兼容性备忘
 
 - `message_id` 等标识字段为 NT 雪花 ID **字符串**（超过 2^53，JS 框架注意精度）
+- **多账号**：同一物理消息在不同账号的事件里各有自己的 `message_id`（各账号
+  内核独立发号）；`get_msg` 等「只凭 message_id 反查」的调用当前走主槽路由，
+  跨账号 message_id 场景请带 `self_id`（v0.8.x 已知边界，后续版本对齐）
 - 群聊 action（群列表/成员/管理/历史）已在真实群环境实测通过
 - 图片/语音/视频/文件发送经内核媒体库落盘后在真实环境验证送达；NT v2 图片直链
   需要 packet 栈获取 rkey，当前以 `get_image` 本地缓存兜底

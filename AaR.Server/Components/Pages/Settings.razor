@@ -5,6 +5,7 @@
 @inject AaROptions Opts
 @inject Ob11Audit Audit
 @inject NavigationManager Nav
+@inject IThemeService Theme
 
 @if (_authFailed)
 {
@@ -56,8 +57,8 @@ else
 
     <h2>主题</h2>
     <div class="row">
-        <FluentButton OnClick="@(() => _ = ToggleThemeAsync())">@(_dark ? "切换到亮色" : "切换到暗色")</FluentButton>
-        <span class="muted">当前：@(_dark ? "暗色" : "亮色")</span>
+        <FluentButton OnClick="@(() => ToggleThemeAsync())">@(_dark ? "切换到亮色" : "切换到暗色")</FluentButton>
+        <span class="muted">当前：@(_dark ? "暗色" : "亮色") · 经 IThemeService（引擎级，含浏览器记忆）</span>
     </div>
 }
 
@@ -102,9 +103,17 @@ else
 
     private async Task ToggleThemeAsync()
     {
-        _dark = !_dark;
-        await JS.InvokeVoidAsync("eval", $"document.body.setAttribute('data-theme', '{(_dark ? "dark" : "light")}')");
+        // FluentUI v5 官方主题引擎（IThemeService）：token 重注 + data-theme 属性
+        // + localStorage 记忆全套；裸 setAttribute 不触发引擎（旧实现无效的根因）
+        await Theme.SwitchThemeAsync();
+        _dark = await Theme.IsDarkModeAsync();
     }
 
-    [Inject] private IJSRuntime JS { get; set; } = default!;
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender && !_authFailed)
+        {
+            try { _dark = await Theme.IsDarkModeAsync(); StateHasChanged(); } catch { }
+        }
+    }
 }

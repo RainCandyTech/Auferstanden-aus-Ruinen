@@ -59,7 +59,7 @@ AaR 是面向 **QQ NT Linux 客户端（3.2.x）** 的 OneBot v11 协议端实�
 |---|---|---|
 | **AaR.Server** | .NET 二进制 | OneBot v11 协议端本体：全部协议逻辑、传输通道、事件转换、对外接口 |
 | **JS 桥** | JavaScript（**0.4.1 起明文分发**） | 运行于 QQ NT 主进程内部，**仅**将 RPC 调用转换为客户端内核函数调用、推送内核事件。不含任何协议逻辑 |
-| **Native 桥** ⚠️ 预研中 | .NET host + 进程内原语（L4 契约） | 零 JS 依赖的桥接形态：契约规范见 `docs/l4-contract-v1.md`（core-v1 + 扩展组 + 多账号槽位），host 骨架与发送原语预研推进中。**Native 发送路径待验证**——生产环境以 JS 桥为准 |
+| **Headless 桥** ⚠️ 预研中（0.9.0 里程碑） | .NET 宿主 + LibNode 内嵌 Node（L4 契约） | 进程外自起 .NET 宿主，经 [node-api-dotnet](https://github.com/microsoft/node-api-dotnet) 的 LibNode 直载 QQ 内核 `wrapper.node`，自管扫码登录——无需运行 QQ 客户端、不注入、不修改 QQ 安装文件。契约规范见 `docs/l4-contract-v1.md`（core-v1 + 扩展组 + 多账号槽位）。挂机 JS 桥仍是生产基线 |
 
 协议端与桥接模块之间通过 SignalR 双向 RPC 通信。桥接模块对协议一无所知——
 这一隔离是刻意设计的。JS 桥自 0.4.1 起以明文分发（此前为混淆分发）；
@@ -205,8 +205,11 @@ QQ NT 的入口解析链路（`package.json` 主字段、`app_launcher` 与内�
 JS 桥具备自动重连与内核会话自愈能力；QQ 重启、登录状态变化、AaR.Server
 重启均不需要人工干预。
 
-Native Hook 桥（实验性）以 `LD_PRELOAD` 方式注入 QQ 主进程，与 JS 桥二选一
-运行；详见 Releases 页面的版本说明。
+Headless 桥接器（0.9.0 里程碑，预研中）：AaR.Server 之外每账号一个 .NET
+宿主进程，内嵌 Node 运行时直载 QQ 内核——不运行 QQ 客户端、不注入、不修改
+QQ 安装文件，扫码登录自管，登录面经服务端透出。历史上的 Native Hook 桥
+（0.4.x 实验性 `LD_PRELOAD` 形态）已取消——Native 发送路径考古结论入档，
+方向改判 Headless（Native 发送要解决的问题在允许桥内有 JS 后不复存在）。
 
 ## 兼容性备忘
 

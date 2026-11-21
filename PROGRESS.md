@@ -80,6 +80,16 @@
 - 事故：@page 双路由三候选歧义 500（AmbiguousMatchException）——
   一页一路由纪律入档；详见 AaR-Test 终版验收。
 
+### 七、当日发版收口（深夜）
+
+- **Rv0.9.0**：Headless 桥接器发行包（aar.Rv0.9.0.tar.zst 49.2MB——
+  libnode 为大头）；
+- **Rv1.0.0-preview1**：服务端发行包（aar.Rv1.0.0-preview1.tar.zst
+  5.5MB——WebUI 管理面板 + JS 桥 0.5.1 原样随包）；
+- 验证口径如实声明：24 项全量回归未随 preview1 执行（第二账号离线，
+  多账号断言无法满足；OB11 核心自 0.8.1 零改动）——正式版前补跑；
+- 双 tag 已打；GitHub Releases 待主理人 token 发布。
+
 ### 红线重申（不变）
 
 不实现任何金钱相关功能（钱包/红包/转账/支付 API、`WALLET` 消息元素、

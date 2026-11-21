@@ -1,5 +1,17 @@
 @inherits LayoutComponentBase
 
-@Body
+<div class="topbar">
+    <div class="brand">AaR <span class="ver">@AaR.Server.Ob11.Ob11Server.ServerVersion</span></div>
+    <nav class="tabs">
+        <NavLink href="ui" Match="NavLinkMatch.Prefix" ActiveClass="on">总览</NavLink>
+        <NavLink href="ui/debug" Match="NavLinkMatch.Prefix" ActiveClass="on">调试台</NavLink>
+        <NavLink href="ui/logs" Match="NavLinkMatch.Prefix" ActiveClass="on">日志</NavLink>
+        <NavLink href="ui/settings" Match="NavLinkMatch.Prefix" ActiveClass="on">设置</NavLink>
+    </nav>
+</div>
+
+<div class="wrap">
+    @Body
+</div>
 
 <FluentProviders />

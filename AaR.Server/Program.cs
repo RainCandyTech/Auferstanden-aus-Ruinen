@@ -35,6 +35,11 @@ builder.Services.Configure<Microsoft.AspNetCore.SignalR.HubOptions>(o =>
 // ---------- WebUI 管理面板（1.0.0-preview1 里程碑）：Blazor Interactive Server + FluentUI ----------
 builder.Services.AddRazorComponents().AddInteractiveServerComponents();
 builder.Services.AddFluentUIComponents();
+// 日志环形缓冲 + OB11 调用审计（WebUI 总览/日志页数据源）
+var logRing = new LogRing(3000);
+builder.Logging.AddProvider(new LogRingLoggerProvider(logRing));
+builder.Services.AddSingleton(logRing);
+builder.Services.AddSingleton<Ob11Audit>();
 
 var app = builder.Build();
 
@@ -50,6 +55,7 @@ var opts = app.Services.GetRequiredService<AaROptions>();
 var registry = app.Services.GetRequiredService<BridgeRegistry>();
 var ob11 = app.Services.GetRequiredService<Ob11Server>();
 var store = app.Services.GetRequiredService<Ob11Store>();
+var audit = app.Services.GetRequiredService<Ob11Audit>();
 await store.InitializeAsync(); // SQLite schema / 内存库锚连接 —— 在接受任何流量前完成
 
 // ---------- OB11 HTTP endpoints ----------
@@ -112,7 +118,11 @@ async Task<IResult> HandleOb11Action(HttpContext ctx, string action)
         if (string.IsNullOrEmpty(echo)) echo = null; // 标准：无 echo → 响应省略该字段
     }
 
+    var callStart = System.Diagnostics.Stopwatch.GetTimestamp();
     var response = await ob11.HandleActionAsync(action, p, echo);
+    // 1.0.0-preview1：调用审计（WebUI 总览「最近调用」）
+    var swMs = (int)((System.Diagnostics.Stopwatch.GetTimestamp() - callStart) / TimeSpan.TicksPerMillisecond);
+    audit.Record(action, (int)response.Retcode, swMs, p.TryGetValue("self_id", out var auditTarget) ? auditTarget?.ToString() : null);
     // 标准：API 不存在 → HTTP 404（body 仍为标准 envelope，retcode 1404）
     return Results.Content(response.ToJson(), "application/json", Encoding.UTF8,
         response.Retcode == 1404 ? 404 : 200);

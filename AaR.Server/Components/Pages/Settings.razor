@@ -1,0 +1,110 @@
+@page "/ui/settings"
+@rendermode InteractiveServer
+@using System.Web
+@using AaR.Server.Ob11
+@inject AaROptions Opts
+@inject Ob11Audit Audit
+@inject NavigationManager Nav
+
+@if (_authFailed)
+{
+    <FluentCard>
+        <div style="padding:24px;text-align:center;">403 · 请携带 <code>?access_token=&lt;token&gt;</code></div>
+    </FluentCard>
+}
+else
+{
+    <h1>设置与服务信息</h1>
+    <p class="sub">运行时摘要（配置值脱敏）</p>
+
+    <div class="stats" style="margin-top:16px;">
+        <FluentCard Class="stat">
+            <span class="k">版本</span>
+            <span class="v">@Ob11Server.ServerVersion</span>
+        </FluentCard>
+        <FluentCard Class="stat">
+            <span class="k">运行时长</span>
+            <span class="v">@_uptime</span>
+        </FluentCard>
+        <FluentCard Class="stat">
+            <span class="k">工作内存</span>
+            <span class="v">@_mem MB</span>
+        </FluentCard>
+        <FluentCard Class="stat">
+            <span class="k">OB11 累计调用</span>
+            <span class="v">@Audit.Total</span>
+        </FluentCard>
+    </div>
+
+    <h2>配置摘要</h2>
+    <FluentCard Style="padding:4px;">
+        <table>
+            <tbody>
+                <tr><td class="muted">鉴权</td><td>@(string.IsNullOrEmpty(Opts.AccessToken) ? "未设置（本机开放——公网部署前请配置 AccessToken）" : "已设置（" + Opts.AccessToken.Length + " 字符）")</td></tr>
+                <tr><td class="muted">桥接端点</td><td>@Opts.BridgeHubPath</td></tr>
+                <tr><td class="muted">正向 WS</td><td>@Opts.Ob11WsPath</td></tr>
+                <tr><td class="muted">桥未连时 HTTP</td><td>@(Opts.RequireBridgeForHttp ? "返回 503" : "放行")</td></tr>
+                <tr><td class="muted">内核 RPC 超时</td><td>@(Opts.BridgeTimeoutMs) ms</td></tr>
+                <tr><td class="muted">心跳间隔</td><td>@(Opts.HeartbeatIntervalMs) ms</td></tr>
+                <tr><td class="muted">存储</td><td>@Opts.Storage?.Provider → @Opts.Storage?.Path</td></tr>
+                <tr><td class="muted">反向 WS 目标</td><td>@((Opts.Reverse?.WebSockets?.Count ?? 0)) 个@((Opts.Reverse?.WebSockets?.Any(t => !string.IsNullOrEmpty(t.SelfId)) == true ? "（含账号绑定）" : ""))</td></tr>
+                <tr><td class="muted">反向 HTTP 目标</td><td>@((Opts.Reverse?.HttpPost?.Count ?? 0)) 个</td></tr>
+                <tr><td class="muted">调试命令</td><td>@(Opts.EnableDebugCommand ? "#AaR 开启" : "关闭")</td></tr>
+            </tbody>
+        </table>
+    </FluentCard>
+
+    <h2>主题</h2>
+    <div class="row">
+        <FluentButton OnClick="@(() => _ = ToggleThemeAsync())">@(_dark ? "切换到亮色" : "切换到暗色")</FluentButton>
+        <span class="muted">当前：@(_dark ? "暗色" : "亮色")</span>
+    </div>
+}
+
+@code {
+    private bool _authFailed;
+    private bool _dark = true;
+    private string _uptime = "-";
+    private long _mem;
+    private DateTime _procStart = DateTime.Now;
+    private PeriodicTimer? _timer;
+
+    protected override void OnInitialized()
+    {
+        var q = HttpUtility.ParseQueryString(new Uri(Nav.Uri).Query);
+        var token = q["access_token"] ?? "";
+        if (!string.IsNullOrEmpty(Opts.AccessToken) && token != Opts.AccessToken)
+        {
+            _authFailed = true;
+            return;
+        }
+        try { _procStart = System.Diagnostics.Process.GetCurrentProcess().StartTime; } catch { }
+        Load();
+        _ = RefreshLoopAsync();
+    }
+
+    private async Task RefreshLoopAsync()
+    {
+        _timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+        while (await _timer.WaitForNextTickAsync())
+        {
+            Load();
+            StateHasChanged();
+        }
+    }
+
+    private void Load()
+    {
+        var up = DateTime.Now - _procStart;
+        _uptime = up.TotalHours >= 1 ? $"{(int)up.TotalHours} 时 {up.Minutes} 分" : $"{up.Minutes} 分 {up.Seconds} 秒";
+        try { _mem = System.Diagnostics.Process.GetCurrentProcess().WorkingSet64 / 1024 / 1024; } catch { }
+    }
+
+    private async Task ToggleThemeAsync()
+    {
+        _dark = !_dark;
+        await JS.InvokeVoidAsync("eval", $"document.body.setAttribute('data-theme', '{(_dark ? "dark" : "light")}')");
+    }
+
+    [Inject] private IJSRuntime JS { get; set; } = default!;
+}

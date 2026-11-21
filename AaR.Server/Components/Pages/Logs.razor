@@ -1,0 +1,89 @@
+@page "/ui/logs"
+@rendermode InteractiveServer
+@using System.Web
+@inject LogRing Ring
+@inject AaROptions Opts
+@inject NavigationManager Nav
+
+@if (_authFailed)
+{
+    <FluentCard>
+        <div style="padding:24px;text-align:center;">403 · 请携带 <code>?access_token=&lt;token&gt;</code></div>
+    </FluentCard>
+}
+else
+{
+    <h1>运行日志</h1>
+    <p class="sub">实时尾随（每秒一拍）· 环形缓冲 3000 条</p>
+
+    <div class="row" style="margin:14px 0;">
+        <input type="text" @bind="_search" placeholder="搜索（消息/模块）" style="min-width:220px;" />
+        <label class="row" style="gap:4px;">
+            <input type="checkbox" @bind="_showWarn" /> WARN
+        </label>
+        <label class="row" style="gap:4px;">
+            <input type="checkbox" @bind="_showError" /> ERROR
+        </label>
+        <label class="row" style="gap:4px;">
+            <input type="checkbox" @bind="_paused" /> 暂停
+        </label>
+        <FluentButton OnClick="@(() => _entries.Clear())">清空视图</FluentButton>
+        <span class="muted">@_entries.Count 行</span>
+    </div>
+
+    <div class="logbox">
+        @foreach (var e in _entries.TakeLast(400))
+        {
+            <div class="logline">
+                <span class="muted">@e.At.ToString("HH:mm:ss")</span>
+                <span class="lv-@e.Level">@e.Level</span>
+                <span class="cat">[@e.Category]</span>
+                <span> @e.Message</span>
+            </div>
+        }
+    </div>
+}
+
+@code {
+    private bool _authFailed;
+    private string _search = "";
+    private bool _showWarn = true, _showError = true, _paused;
+    private readonly List<LogRing.Entry> _entries = new();
+    private long _cursor;
+    private PeriodicTimer? _timer;
+
+    protected override void OnInitialized()
+    {
+        var q = HttpUtility.ParseQueryString(new Uri(Nav.Uri).Query);
+        var token = q["access_token"] ?? "";
+        if (!string.IsNullOrEmpty(Opts.AccessToken) && token != Opts.AccessToken)
+        {
+            _authFailed = true;
+            return;
+        }
+        _ = RefreshLoopAsync();
+    }
+
+    private async Task RefreshLoopAsync()
+    {
+        _timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+        while (await _timer.WaitForNextTickAsync())
+        {
+            if (_paused) continue;
+            var (fresh, cursor) = Ring.Read(_cursor, 300);
+            _cursor = cursor;
+            if (fresh.Count == 0) continue;
+            foreach (var e in fresh)
+            {
+                if (e.Level == "WARN" && !_showWarn) continue;
+                if (e.Level == "ERROR" && !_showError) continue;
+                if (_search.Length > 0 &&
+                    !e.Message.Contains(_search, StringComparison.OrdinalIgnoreCase) &&
+                    !e.Category.Contains(_search, StringComparison.OrdinalIgnoreCase)) continue;
+                _entries.Add(e);
+            }
+            while (_entries.Count > 1200) _entries.RemoveAt(0);
+            StateHasChanged();
+        }
+    }
+}

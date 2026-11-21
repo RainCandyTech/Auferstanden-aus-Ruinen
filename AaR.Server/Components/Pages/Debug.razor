@@ -1,0 +1,129 @@
+@page "/ui/debug"
+@rendermode InteractiveServer
+@using System.Web
+@using AaR.Server.Ob11
+@inject Ob11Server Ob11
+@inject AaROptions Opts
+@inject NavigationManager Nav
+
+@if (_authFailed)
+{
+    <FluentCard>
+        <div style="padding:24px;text-align:center;">403 · 请携带 <code>?access_token=&lt;token&gt;</code></div>
+    </FluentCard>
+}
+else
+{
+    <h1>OneBot 调试台</h1>
+    <p class="sub">动作直调（服务端内环，不绕 HTTP）· 与 OB11 客户端同一代码路径</p>
+
+    <div class="row" style="margin-top:16px;">
+        <select @bind="_action" style="min-width:240px;">
+            @foreach (var a in _presets.Keys)
+            {
+                <option value="@a">@a</option>
+            }
+            <option value="__custom">— 自定义动作 —</option>
+        </select>
+        @if (_action == "__custom")
+        {
+            <input type="text" @bind="_customAction" placeholder="action 名" style="min-width:200px;" />
+        }
+    </div>
+
+    <div class="muted" style="margin:8px 0 4px;">参数 JSON（缺省模板可改）</div>
+    <textarea @bind="_params"></textarea>
+
+    <div class="row" style="margin-top:10px;">
+        <FluentButton Appearance="ButtonAppearance.Primary" OnClick="@InvokeAsync">调用</FluentButton>
+        <span class="muted">@_status</span>
+    </div>
+
+    @if (_respLength > 0)
+    {
+        <h2>响应</h2>
+        <FluentCard>
+            <div style="padding:12px;">
+                <div class="muted">retcode=@_retcode · @_ms ms</div>
+                <pre style="margin-top:8px;">@_body</pre>
+            </div>
+        </FluentCard>
+    }
+}
+
+@code {
+    private bool _authFailed;
+    private string _action = "get_login_info";
+    private string _customAction = "";
+    private string _params = "{ }";
+    private string _status = "";
+    private string _body = "";
+    private int _retcode;
+    private int _ms;
+    private int _respLength;
+
+    private readonly Dictionary<string, string> _presets = new()
+    {
+        ["get_login_info"] = "{ }",
+        ["get_version_info"] = "{ }",
+        ["get_group_list"] = "{ }",
+        ["get_friend_list"] = "{ }",
+        ["get_group_info"] = @"{ ""group_id"": 1132506318 }",
+        ["get_group_member_list"] = @"{ ""group_id"": 1132506318 }",
+        ["get_group_msg_history"] = @"{ ""group_id"": 1132506318, ""count"": 5 }",
+        ["get_recent_contacts"] = "{ }",
+        ["send_group_msg"] = @"{ ""group_id"": 1132506318, ""message"": [ { ""type"": ""text"", ""data"": { ""text"": ""WebUI 调试台探针"" } } ] }",
+        ["send_private_msg"] = @"{ ""user_id"": 0, ""message"": [ { ""type"": ""text"", ""data"": { ""text"": ""hello"" } } ] }",
+    };
+
+    protected override void OnInitialized()
+    {
+        var q = HttpUtility.ParseQueryString(new Uri(Nav.Uri).Query);
+        var token = q["access_token"] ?? "";
+        if (!string.IsNullOrEmpty(Opts.AccessToken) && token != Opts.AccessToken)
+        {
+            _authFailed = true;
+            return;
+        }
+        _params = _presets[_action];
+    }
+
+    private void OnActionChanged(string value)
+    {
+        _action = value;
+        if (_presets.TryGetValue(value, out var tpl)) _params = tpl;
+    }
+
+    private async Task InvokeAsync()
+    {
+        var action = _action == "__custom" ? _customAction.Trim() : _action;
+        if (action.Length == 0) { _status = "动作名为空"; return; }
+        _status = "调用中…";
+        try
+        {
+            var p = new Dictionary<string, object?>();
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(string.IsNullOrWhiteSpace(_params) ? "{}" : _params);
+                foreach (var prop in doc.RootElement.EnumerateObject()) p[prop.Name] = prop.Value.Clone();
+            }
+            catch (System.Text.Json.JsonException je)
+            {
+                _status = "参数 JSON 无效：" + je.Message;
+                return;
+            }
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var resp = await Ob11.HandleActionAsync(action, p, "webui-debug");
+            sw.Stop();
+            _retcode = (int)resp.Retcode;
+            _ms = (int)sw.ElapsedMilliseconds;
+            _body = resp.ToJson();
+            _respLength = _body.Length;
+            _status = "完成";
+        }
+        catch (Exception ex)
+        {
+            _status = "异常：" + ex.Message;
+        }
+    }
+}

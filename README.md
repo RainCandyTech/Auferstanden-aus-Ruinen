@@ -16,7 +16,9 @@ V1.0.0 Preview 1 里程碑：
 |OnebotV11的标准符合性|V0.5.2 OK|
 |消息、seq、媒体索引的持久化|V0.5.0 OK|
 |多账号以及在反向WS中的多账号正确实现|~~V0.8.0~~  V0.8.1 OK|
-|Native桥接器基线版本|V1.0.0-preview1|
+|~~Native桥接器基线版本~~|~~V1.0.0-preview1~~|
+|Headless桥接器|V0.9.0|
+|WebUI管理面板|V1.0.0-preview1|
 
 更多里程碑：
 

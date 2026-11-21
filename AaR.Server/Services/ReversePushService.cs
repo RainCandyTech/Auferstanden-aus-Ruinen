@@ -6,12 +6,16 @@ using AaR.Server.Ob11;
 
 namespace AaR.Server.Services;
 
-/// <summary>OneBot v11 reverse WebSocket target (we are the WS client; the bot framework hosts the server).</summary>
+/// <summary>OneBot v11 reverse WebSocket target (we are the WS client; the bot framework hosts the server).
+/// 0.8.1：SelfId 账号绑定——一 bot 一连接。绑定后：事件按 self_id 过滤推送、该连接
+/// 回传的 API 调用默认路由到绑定槽、握手 X-Self-ID 报绑定 uin。缺省（不绑）= 全量
+/// 推送 + 主槽路由（0.8.0 兼容行为）。</summary>
 public class ReverseWsTarget
 {
     public string Url { get; set; } = "";
     public string AccessToken { get; set; } = "";
     public int ReconnectMs { get; set; } = 5000;
+    public string? SelfId { get; set; }              // 绑定账号 uin（hello 同口径）
 }
 
 /// <summary>OneBot v11 HTTP POST reporting target (we POST events; the upstream may reply with API calls).</summary>
@@ -102,8 +106,10 @@ public class ReversePushService : BackgroundService
                 if (!string.IsNullOrEmpty(target.AccessToken))
                     ws.Options.SetRequestHeader("Authorization", "Bearer " + target.AccessToken);
                 // OneBot v11 reverse-ws spec: X-Self-ID + X-Client-Role on handshake
-                if (!string.IsNullOrEmpty(_ob11.SelfUin))
-                    ws.Options.SetRequestHeader("X-Self-ID", _ob11.SelfUin);
+                // 0.8.1：绑定账号的目标报绑定 uin；未绑定回落主槽缓存（兼容）
+                var handShakeSelf = !string.IsNullOrEmpty(target.SelfId) ? target.SelfId : _ob11.SelfUin;
+                if (!string.IsNullOrEmpty(handShakeSelf))
+                    ws.Options.SetRequestHeader("X-Self-ID", handShakeSelf);
                 ws.Options.SetRequestHeader("X-Client-Role", "Universal");
 
                 var uri = new Uri(target.Url);
@@ -118,12 +124,13 @@ public class ReversePushService : BackgroundService
                     await Task.Delay(500, ct);
 
                 // announce self id on connect (spec: X-Self-ID header equivalent in-band)
+                // 0.8.1：生命周期事件同样报绑定口径（未绑定回落主槽缓存）
                 try
                 {
                     await SendFrameAsync(idx, ws, Ob11Json.Serialize(new Dictionary<string, object?>
                     {
                         ["time"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                        ["self_id"] = SelfUin,
+                        ["self_id"] = handShakeSelf,
                         ["post_type"] = "meta_event",
                         ["meta_event_type"] = "lifecycle",
                         ["sub_type"] = "connect",
@@ -190,6 +197,13 @@ public class ReversePushService : BackgroundService
             if (root.TryGetProperty("params", out var ps) && ps.ValueKind == JsonValueKind.Object)
                 foreach (var prop in ps.EnumerateObject())
                     p[prop.Name] = prop.Value.Clone();
+            // 0.8.1：绑定账号的连接，其回传 API 默认路由到绑定槽——注入 self_id
+            //   缺省（调用方显式传 self_id 优先，TryAdd 语义）
+            {
+                string? bound = null;
+                lock (_socketsLock) { if (idx < _sockets.Count) bound = _sockets[idx].Target.SelfId; }
+                if (!string.IsNullOrEmpty(bound)) p.TryAdd("self_id", bound);
+            }
 
             var response = await _ob11.HandleActionAsync(action, p, echo, echoRaw);
             await SendFrameAsync(idx, ws, response.ToJson(), ct);
@@ -218,25 +232,37 @@ public class ReversePushService : BackgroundService
 
     private async Task FanOutWsAsync(string json, CancellationToken ct)
     {
+        // 0.8.1：多账号过滤——事件 self_id 与目标绑定匹配才推；未绑定目标 = 全量
+        //   （0.8.0 兼容）；事件无 self_id 时不过滤（无法归因则全推）
+        var evtSelfId = ExtractEventSelfId(json);
         List<Task> sends;
         lock (_socketsLock)
         {
             sends = new List<Task>();
-            foreach (var (i, ws) in _sockets.Select((s, i) => (i, s.Ws)))
+            for (int i = 0; i < _sockets.Count; i++)
             {
-                if (ws is { State: WebSocketState.Open })
+                var (target, ws) = _sockets[i];
+                if (ws is not { State: WebSocketState.Open }) continue;
+                if (!string.IsNullOrEmpty(target.SelfId) && evtSelfId is not null &&
+                    target.SelfId != evtSelfId) continue;
+                var i2 = i;
+                // fire-and-forget but with the per-connection send lock held
+                // until the frame is written
+                sends.Add(Task.Run(async () =>
                 {
-                    // fire-and-forget but with the per-connection send lock held
-                    // until the frame is written
-                    sends.Add(Task.Run(async () =>
-                    {
-                        try { await SendFrameAsync(i, ws, json, ct); }
-                        catch { /* reconnect loop owns failures */ }
-                    }, CancellationToken.None));
-                }
+                    try { await SendFrameAsync(i2, ws, json, ct); }
+                    catch { /* reconnect loop owns failures */ }
+                }, CancellationToken.None));
             }
         }
         try { await Task.WhenAll(sends); } catch { /* individual failures logged by loops */ }
+    }
+
+    /// <summary>事件 JSON 的 self_id 提取（只读字符串级，FanOut 过滤用）。</summary>
+    private static string? ExtractEventSelfId(string json)
+    {
+        var m = System.Text.RegularExpressions.Regex.Match(json, "\"self_id\"\\s*:\\s*\"?([0-9]+)\"?");
+        return m.Success ? m.Groups[1].Value : null;
     }
 
     // ---------- reverse HTTP POST ----------

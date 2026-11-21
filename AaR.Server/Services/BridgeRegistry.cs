@@ -238,12 +238,14 @@ public sealed class BridgeRegistry
     }
 
     /// <summary>能力守卫（docs/l4-contract-v1.md §3.3/§6）：null = 放行；否则返回缺失的扩展组名。
-    /// 只对 hello 申报过的槽生效——legacy 与 pending 槽按满能力假定（过渡兼容）。</summary>
-    public string? MissingCapability(string action)
+    /// 只对 hello 申报过的槽生效——legacy 与 pending 槽按满能力假定（过渡兼容）。
+    /// 0.8.1：targetUin 参数化——守卫必须查「路由目标槽」而非缺省主槽（0.8.0 的
+    /// self_id 路由落地后守卫仍查 ResolveTarget(null)，目标槽缺能力会误放行）。</summary>
+    public string? MissingCapability(string action, string? targetUin = null)
     {
         var required = L4Dispatch.RequiredExt(action);
         if (required is null) return null;
-        var conn = ResolveTarget(null);
+        var conn = ResolveTarget(string.IsNullOrEmpty(targetUin) ? null : targetUin);
         if (conn is null) return null;                 // 无桥 → 既有 "bridge not connected" 路径
         if (conn == _legacyConnectionId) return null;  // legacy = 满能力假定
         if (!_slots.TryGetValue(conn, out var slot)) return null;
@@ -258,6 +260,19 @@ public sealed class BridgeRegistry
     public string? UinOfConnection(string connectionId)
     {
         return _slots.TryGetValue(connectionId, out var s) && !string.IsNullOrEmpty(s.Uin) ? s.Uin : null;
+    }
+
+    /// <summary>0.8.1：注册表全槽清单（#AaR 横幅多账号可观测）——hello 绑定过的槽，uin 升序。</summary>
+    public List<(string Uin, string Bridge, string Version)> DescribeSlots()
+    {
+        var outv = new List<(string, string, string)>();
+        foreach (var kv in _slots)
+        {
+            if (kv.Value.HelloSeen && !string.IsNullOrEmpty(kv.Value.Uin))
+                outv.Add((kv.Value.Uin!, kv.Value.Bridge, kv.Value.Version));
+        }
+        outv.Sort((a, b) => string.CompareOrdinal(a.Item1, b.Item1));
+        return outv;
     }
 
     /// <summary>缺省路由桥描述（#AaR 横幅用）：类型 / 申报版本（legacy 未申报 = null）/ 契约核心。</summary>

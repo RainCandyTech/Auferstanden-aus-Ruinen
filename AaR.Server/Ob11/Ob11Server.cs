@@ -29,7 +29,7 @@ public class Ob11Server
     public volatile string SelfNick = "";
 
     /// <summary>Server version reported by get_version_info and the #AaR debug command.</summary>
-    public const string ServerVersion = "0.8.0";
+    public const string ServerVersion = "0.8.1";
 
     // msgId -> "chatType|peerUid|seq" for delete_msg / get_msg / reply building
     private readonly ConcurrentDictionary<string, string> _msgIndex = new();
@@ -953,6 +953,12 @@ public class Ob11Server
             sb.AppendLine($"self        : uin={SelfUin} uid={SelfUid} nick={SelfNick}");
             sb.AppendLine($"bridge      : {(_bridge.IsBridgeConnected ? "connected" : "NOT connected")}" +
                 (_bridge.DescribeTargetBridge() is { } db ? $" ({db.Bridge} v={db.Version ?? "-"} core={db.Core})" : ""));
+            // 0.8.1：多账号全槽清单（hello 绑定过的槽，主路由=首绑）
+            var slots = _bridge.DescribeSlots();
+            var slotsLine = slots.Count == 0
+                ? "-"
+                : string.Join(", ", slots.Select(s => $"{s.Uin}({s.Bridge} v={(s.Version.Length > 0 ? s.Version : "-")})"));
+            sb.AppendLine($"slots       : {slotsLine}");
             sb.AppendLine($"auth        : token {(string.IsNullOrEmpty(_opts.AccessToken) ? "NOT set (auth disabled)" : $"set ({_opts.AccessToken.Length} chars)")}");
             sb.AppendLine($"endpoints   : hub={_opts.BridgeHubPath} ws={_opts.Ob11WsPath}");
             sb.AppendLine($"flags       : RequireBridgeForHttp={_opts.RequireBridgeForHttp} EnableDebugKernel={_opts.EnableDebugKernel} EnableDebugCommand={_opts.EnableDebugCommand}");
@@ -1146,7 +1152,8 @@ public class Ob11Server
         var guardAction = action;
         if (guardAction.EndsWith("_async", StringComparison.Ordinal)) guardAction = guardAction[..^6];
         else if (guardAction.EndsWith("_rate_limited", StringComparison.Ordinal)) guardAction = guardAction[..^13];
-        var missingExt = _bridge.MissingCapability(guardAction);
+        // 0.8.1：守卫查路由目标槽（_reqTargetUin），不再固定查主槽
+        var missingExt = _bridge.MissingCapability(guardAction, _reqTargetUin.Value);
         if (missingExt is not null)
             return Ob11Response.Fail(Ob11.RetUnsupported, "bridge capability missing: " + missingExt, echo: echo, echoRaw: echoRaw);
 

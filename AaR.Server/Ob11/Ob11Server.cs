@@ -20,10 +20,16 @@ public class Ob11Server
 
     public volatile string SelfUid = "";
     public volatile string SelfUin = "";
+
+    // 0.8.0：多账号路由（双 AsyncLocal 通道）
+    //   _reqTargetUin：OB11 请求 self_id → ResolveTarget(uin) 精确寻址（缺省主槽不变）
+    //   _evtSelfId：事件 self_id 按推送连接的槽位标注（hub 传入绑定 uin，回落主槽缓存）
+    private static readonly AsyncLocal<string?> _reqTargetUin = new();
+    private static readonly AsyncLocal<string?> _evtSelfId = new();
     public volatile string SelfNick = "";
 
     /// <summary>Server version reported by get_version_info and the #AaR debug command.</summary>
-    public const string ServerVersion = "0.7.0";
+    public const string ServerVersion = "0.8.0";
 
     // msgId -> "chatType|peerUid|seq" for delete_msg / get_msg / reply building
     private readonly ConcurrentDictionary<string, string> _msgIndex = new();
@@ -158,7 +164,7 @@ public class Ob11Server
                 await BroadcastAsync(new Dictionary<string, object?>
                 {
                     ["time"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    ["self_id"] = SelfUin,
+                    ["self_id"] = _evtSelfId.Value ?? SelfUin,
                     ["post_type"] = "meta_event",
                     ["meta_event_type"] = "lifecycle",
                     ["sub_type"] = "connect",
@@ -179,7 +185,7 @@ public class Ob11Server
             await BroadcastAsync(new Dictionary<string, object?>
             {
                 ["time"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                ["self_id"] = SelfUin,
+                ["self_id"] = _evtSelfId.Value ?? SelfUin,
                 ["post_type"] = "meta_event",
                 ["meta_event_type"] = "heartbeat",
                 ["status"] = new Dictionary<string, object?>
@@ -200,9 +206,12 @@ public class Ob11Server
     // shared HttpClient for download_file (a per-call new HttpClient() leaks sockets)
     private static readonly HttpClient DownloadHttp = new() { Timeout = TimeSpan.FromSeconds(120) };
 
-    public async Task OnInternalEventAsync(string name, string payloadJson)
+    public async Task OnInternalEventAsync(string name, string payloadJson, string? slotUin = null)
     {
         EventsReceived++;
+        // 0.8.0：事件 self_id 按推送槽标注（hub 传入该连接 hello 绑定的 uin；
+        //   legacy/未绑 → null → 事件戳回落主槽缓存 SelfUin）
+        _evtSelfId.Value = slotUin;
         try
         {
             using var doc = JsonDocument.Parse(payloadJson);
@@ -284,7 +293,7 @@ public class Ob11Server
             var evt = new Dictionary<string, object?>
             {
                 ["time"] = Ob11.Long(rec, "msgTime"),
-                ["self_id"] = SelfUin,
+                ["self_id"] = _evtSelfId.Value ?? SelfUin,
                 ["post_type"] = "message",
                 ["message_type"] = isGroup ? "group" : "private",
                 ["sub_type"] = Ob11.Str(rec, "subMsgType") == "1" ? "normal" : (isGroup ? "normal" : "friend"),
@@ -313,7 +322,7 @@ public class Ob11Server
                 await BroadcastAsync(new Dictionary<string, object?>
                 {
                     ["time"] = Ob11.Long(rec, "msgTime"),
-                    ["self_id"] = SelfUin,
+                    ["self_id"] = _evtSelfId.Value ?? SelfUin,
                     ["post_type"] = "notice",
                     ["notice_type"] = "group_upload",
                     ["group_id"] = peerUid,
@@ -543,7 +552,7 @@ public class Ob11Server
                 await BroadcastAsync(new Dictionary<string, object?>
                 {
                     ["time"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    ["self_id"] = SelfUin,
+                    ["self_id"] = _evtSelfId.Value ?? SelfUin,
                     ["post_type"] = "notice",
                     ["notice_type"] = isGroup ? "group_recall" : "friend_recall",
                     ["group_id"] = isGroup ? (Ob11.Str(rec, "peerUid") ?? "") : null,
@@ -600,7 +609,7 @@ public class Ob11Server
                 var evt = new Dictionary<string, object?>
                 {
                     ["time"] = Ob11.Long(rec, "msgTime"),
-                    ["self_id"] = SelfUin,
+                    ["self_id"] = _evtSelfId.Value ?? SelfUin,
                     ["post_type"] = "message_sent",
                     ["message_type"] = isGroup ? "group" : "private",
                     ["sub_type"] = "normal",
@@ -666,7 +675,7 @@ public class Ob11Server
                     await BroadcastAsync(new Dictionary<string, object?>
                     {
                         ["time"] = Ob11.Long(rec, "msgTime"),
-                        ["self_id"] = SelfUin,
+                        ["self_id"] = _evtSelfId.Value ?? SelfUin,
                         ["post_type"] = "notice",
                         ["notice_type"] = isGroup ? "group_recall" : "friend_recall",
                         ["group_id"] = isGroup ? (Ob11.Str(rec, "peerUid") ?? "") : null,
@@ -687,7 +696,7 @@ public class Ob11Server
                         await BroadcastAsync(new Dictionary<string, object?>
                         {
                             ["time"] = Ob11.Long(rec, "msgTime"),
-                            ["self_id"] = SelfUin,
+                            ["self_id"] = _evtSelfId.Value ?? SelfUin,
                             ["post_type"] = "notice",
                             ["notice_type"] = "group_increase",
                             ["group_id"] = Ob11.Str(rec, "peerUid") ?? "",
@@ -703,7 +712,7 @@ public class Ob11Server
                         await BroadcastAsync(new Dictionary<string, object?>
                         {
                             ["time"] = Ob11.Long(rec, "msgTime"),
-                            ["self_id"] = SelfUin,
+                            ["self_id"] = _evtSelfId.Value ?? SelfUin,
                             ["post_type"] = "notice",
                             ["notice_type"] = "group_decrease",
                             ["group_id"] = Ob11.Str(rec, "peerUid") ?? "",
@@ -722,7 +731,7 @@ public class Ob11Server
                         await BroadcastAsync(new Dictionary<string, object?>
                         {
                             ["time"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                            ["self_id"] = SelfUin,
+                            ["self_id"] = _evtSelfId.Value ?? SelfUin,
                             ["post_type"] = "notice",
                             ["notice_type"] = "group_ban",
                             ["sub_type"] = duration > 0 ? "ban" : "lift_ban",
@@ -747,7 +756,7 @@ public class Ob11Server
                             await BroadcastAsync(new Dictionary<string, object?>
                             {
                                 ["time"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                                ["self_id"] = SelfUin,
+                                ["self_id"] = _evtSelfId.Value ?? SelfUin,
                                 ["post_type"] = "notice",
                                 ["notice_type"] = "notify",
                                 ["sub_type"] = "poke",
@@ -778,7 +787,7 @@ public class Ob11Server
                 await BroadcastAsync(new Dictionary<string, object?>
                 {
                     ["time"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    ["self_id"] = SelfUin,
+                    ["self_id"] = _evtSelfId.Value ?? SelfUin,
                     ["post_type"] = "request",
                     ["request_type"] = "friend",
                     ["user_id"] = LookupUin(friendUid),
@@ -1020,7 +1029,7 @@ public class Ob11Server
                 var item = new Dictionary<string, object?>
                 {
                     ["time"] = Ob11.Long(rec, "msgTime"),
-                    ["self_id"] = SelfUin,
+                    ["self_id"] = _evtSelfId.Value ?? SelfUin,
                     ["post_type"] = chatType == 2 ? "group" : "private",
                     ["message_id"] = mid,
                     ["user_id"] = senderUin,
@@ -1126,6 +1135,11 @@ public class Ob11Server
 
     public async Task<Ob11Response> HandleActionAsync(string action, Dictionary<string, object?> p, string? echo, JsonElement? echoRaw)
     {
+        // 0.8.0：OB11 请求 self_id → 目标账号槽（多账号路由入口）。请求体/查询参数
+        //   皆可带（p 合并了两处）；缺省/未知值 → 主槽路由（单账号行为不变）。
+        _reqTargetUin.Value = p.TryGetValue("self_id", out var sv) ? sv?.ToString() : null;
+        if (string.IsNullOrEmpty(_reqTargetUin.Value)) _reqTargetUin.Value = null;
+
         // L4v1 能力守卫（docs/l4-contract-v1.md §3.3/§6）：hello 申报过能力的槽不含本动作所需
         // 扩展组 → 显式降级（retcode 1200 + wording）；legacy/pending 槽按满能力假定放行。
         // _async / _rate_limited 后缀先剥离再查表（守卫先于异步化，失败响应即时返回）。
@@ -1197,7 +1211,10 @@ public class Ob11Server
 
     private async Task<JsonElement> CallKernel(string method, object? rpcParams, int? timeoutMs = null)
     {
-        var (ok, dataOpt, err) = await _bridge.CallJsonAsync(_hub, method, rpcParams, timeoutMs);
+        // 0.8.0：目标槽路由（请求 self_id → ResolveTarget(uin)；缺省 null = 主槽）
+        var target = _reqTargetUin.Value;
+        var (ok, dataOpt, err) = await _bridge.CallJsonAsync(_hub, method, rpcParams, timeoutMs,
+            string.IsNullOrEmpty(target) ? null : target);
         if (!ok) throw new Ob11BadException($"kernel call {method} failed: {err}");
         return dataOpt ?? JsonSerializer.SerializeToElement(new object());
     }
@@ -1257,6 +1274,16 @@ public class Ob11Server
         switch (action)
         {
             case "get_login_info":
+                // 0.8.0：带 self_id → 目标槽实查（CallKernel 路由）；缺省 → 主槽缓存口径不变
+                if (!string.IsNullOrEmpty(_reqTargetUin.Value))
+                {
+                    var si = await CallKernel("self.info", null, 10000);
+                    return ToElement(new Dictionary<string, object?>
+                    {
+                        ["user_id"] = Ob11.Str(si, "uin") ?? _reqTargetUin.Value,
+                        ["nickname"] = Ob11.Str(si, "nick") ?? "",
+                    });
+                }
                 return ToElement(await LoadSelfAsync());
 
             case "send_private_msg":
@@ -1368,7 +1395,7 @@ public class Ob11Server
                         var data = new Dictionary<string, object?>
                         {
                             ["time"] = Ob11.Long(rec, "msgTime"),
-                            ["self_id"] = SelfUin,
+                            ["self_id"] = _evtSelfId.Value ?? SelfUin,
                             ["real_id"] = msgId,
                             ["post_type"] = isGroup ? "group" : "private",
                             ["message_type"] = isGroup ? "group" : "private",

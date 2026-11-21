@@ -77,8 +77,9 @@ public class AaRHub : Hub
             }
             return;
         }
-        _logger.LogInformation("[event] {Name} ({Len} bytes)", name, payloadJson.Length);
-        await _ob11.OnInternalEventAsync(name, payloadJson);
+        _logger.LogInformation("[event] {Name} ({Len} bytes) slot={Uin}", name, payloadJson.Length,
+            _registry.UinOfConnection(Context.ConnectionId) ?? "-");
+        await _ob11.OnInternalEventAsync(name, payloadJson, _registry.UinOfConnection(Context.ConnectionId));
     }
 
     public void InternalLog(string level, string line)

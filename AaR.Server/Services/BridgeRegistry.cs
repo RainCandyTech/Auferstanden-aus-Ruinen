@@ -254,6 +254,12 @@ public sealed class BridgeRegistry
             : required;
     }
 
+    /// <summary>0.8.0：事件 self_id 按推送槽标注——该连接 hello 绑定的 uin（legacy/未绑 = null，回落主槽缓存）。</summary>
+    public string? UinOfConnection(string connectionId)
+    {
+        return _slots.TryGetValue(connectionId, out var s) && !string.IsNullOrEmpty(s.Uin) ? s.Uin : null;
+    }
+
     /// <summary>缺省路由桥描述（#AaR 横幅用）：类型 / 申报版本（legacy 未申报 = null）/ 契约核心。</summary>
     public (string Bridge, string? Version, string Core)? DescribeTargetBridge()
     {

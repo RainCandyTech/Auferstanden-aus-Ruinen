@@ -7,7 +7,7 @@ AaR 从废墟中站起，接过了这个位置。
 
 ---
 
-### V1.0.0 Preview 1 即将发布，敬请期待！
+### 欢迎使用 Auferstanden aus Ruinen V1.0.0 Preview 1 ！
 
 V1.0.0 Preview 1 里程碑：
 
@@ -18,7 +18,7 @@ V1.0.0 Preview 1 里程碑：
 |多账号以及在反向WS中的多账号正确实现|~~V0.8.0~~  V0.8.1 OK|
 |~~Native桥接器基线版本~~|~~V1.0.0-preview1~~|
 |Headless桥接器|V0.9.0 OK|
-|WebUI管理面板|V1.0.0-preview1|
+|WebUI管理面板|V1.0.0-preview1 OK|
 
 更多里程碑：
 

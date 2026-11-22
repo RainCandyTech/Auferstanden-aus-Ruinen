@@ -386,7 +386,12 @@ public static class Ob11Mapper
     /// <summary>Raw kernel RPC helper for media staging (protocol logic stays server-side).</summary>
     private static async Task<JsonElement> KernelAsync(BridgeRegistry registry, IHubContext<Hubs.AaRHub> hub, string method, object rpcParams)
     {
-        var (ok, data, err) = await registry.CallJsonAsync(hub, method, rpcParams);
+        // 1.0.0-preview2：跟随请求槽路由（msg.prepareMedia 等 staging 调用必须与
+        // msg.send 同账号内核——否则媒体文件落主槽 HOME、发送内核读不到）。
+        // OB11 请求上下文里 _reqTargetUin 已由 HandleActionAsync 落位（AsyncLocal
+        // 沿 await 流流动至此）；请求上下文外（事件路径等）为 null → 主槽（原行为）
+        var (ok, data, err) = await registry.CallJsonAsync(hub, method, rpcParams,
+            targetUin: Ob11Server._reqTargetUin.Value);
         if (!ok) throw new Ob11BadException($"kernel call {method} failed: {err}");
         return data ?? JsonSerializer.SerializeToElement(new object());
     }

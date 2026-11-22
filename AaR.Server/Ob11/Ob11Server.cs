@@ -24,7 +24,11 @@ public class Ob11Server
     // 0.8.0：多账号路由（双 AsyncLocal 通道）
     //   _reqTargetUin：OB11 请求 self_id → ResolveTarget(uin) 精确寻址（缺省主槽不变）
     //   _evtSelfId：事件 self_id 按推送连接的槽位标注（hub 传入绑定 uin，回落主槽缓存）
-    private static readonly AsyncLocal<string?> _reqTargetUin = new();
+    // 1.0.0-preview2：_reqTargetUin internal 化——Ob11Mapper 的内核调用
+    // （msg.prepareMedia 等）必须与请求同槽：staging 走主槽会把媒体文件落进
+    // 主槽 HOME 的媒体库，msg.send 却从请求账号内核读——跨 HOME 断链
+    // （rich media transfer failed，账号 2 群发图实拍定位）
+    internal static readonly AsyncLocal<string?> _reqTargetUin = new();
     private static readonly AsyncLocal<string?> _evtSelfId = new();
     public volatile string SelfNick = "";
 

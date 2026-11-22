@@ -293,8 +293,11 @@ public class Ob11Server
 
             // #AaR in-chat debug command: fire-and-forget so a slow kernel send
             // never delays event mapping; self-sent records are skipped to
-            // guarantee the reply can never re-trigger the command
-            if (_opts.EnableDebugCommand && senderUid != SelfUid)
+            // guarantee the reply can never re-trigger the command.
+            // 1.0.0-preview2：多账号——自触发守卫按「事件归属账号」判（旧口径
+            // 比主槽 uid，账号 2 的自发消息不被识别为 self）
+            var selfUinForGuard = !string.IsNullOrEmpty(_evtSelfId.Value) ? _evtSelfId.Value : SelfUin;
+            if (_opts.EnableDebugCommand && senderUin != selfUinForGuard)
                 _ = TryHandleDebugCommandAsync(chatType, peerUid, senderUid, senderUin, msgId, segments);
 
             var evt = new Dictionary<string, object?>
@@ -871,6 +874,11 @@ public class Ob11Server
             // sanitized summary -> chat reply via the kernel
             var reply = BuildSanitizedDebugInfo(chatType);
             var elements = new List<Dictionary<string, object?>> { Ob11Mapper.TextEl(reply) };
+            // 1.0.0-preview2：回复按「事件归属账号」路由（msg.send 缺省走主槽——
+            // 多账号下触发账号与主槽不同时，主槽不在该会话 → onSendMsgError 无回应；
+            // AsyncLocal 在 fire-and-forget 分叉时已捕获事件归属值，此处显式落位）
+            var evtOwner = _evtSelfId.Value;
+            if (!string.IsNullOrEmpty(evtOwner)) _reqTargetUin.Value = evtOwner;
             await CallKernel("msg.send", new { chatType, peerUid, elements });
         }
         catch (Exception ex)

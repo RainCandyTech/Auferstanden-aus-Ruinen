@@ -54,6 +54,31 @@ public sealed class Ob11Store
             await db.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
         }
         await db.Database.EnsureCreatedAsync();
+        // EnsureCreated 对已存在的库不建新表（1.0.0-preview2 新增 Accounts/ReverseTargets
+        // 需在老库上补齐）——幂等 DDL，新库上为空操作
+        await db.Database.ExecuteSqlRawAsync("""
+            CREATE TABLE IF NOT EXISTS "Accounts" (
+                "Uin" TEXT NOT NULL CONSTRAINT "PK_Accounts" PRIMARY KEY,
+                "Nickname" TEXT NULL,
+                "Bridge" TEXT NOT NULL,
+                "Version" TEXT NOT NULL,
+                "FirstSeenAt" TEXT NOT NULL,
+                "LastSeenAt" TEXT NOT NULL,
+                "LastOfflineAt" TEXT NULL
+            );
+            CREATE INDEX IF NOT EXISTS "IX_Accounts_LastSeenAt" ON "Accounts" ("LastSeenAt");
+            CREATE TABLE IF NOT EXISTS "ReverseTargets" (
+                "Id" INTEGER NOT NULL CONSTRAINT "PK_ReverseTargets" PRIMARY KEY AUTOINCREMENT,
+                "Kind" TEXT NOT NULL,
+                "Url" TEXT NOT NULL,
+                "AccessToken" TEXT NULL,
+                "SelfId" TEXT NULL,
+                "ReconnectMs" INTEGER NOT NULL,
+                "Enabled" INTEGER NOT NULL,
+                "CreatedAt" TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS "IX_ReverseTargets_Kind" ON "ReverseTargets" ("Kind");
+            """);
         _logger.LogInformation("ob11 store ready: provider={Provider} source={Source}",
             _isMemory ? "memory(shared-cache)" : "sqlite",
             _isMemory ? ":memory:" : ((SqliteConnection)db.Database.GetDbConnection()).DataSource);
@@ -222,6 +247,181 @@ public sealed class Ob11Store
             return (await db.Markers.FindAsync(marker))?.RealMsgId;
         }
         catch (Exception ex) { _logger.LogWarning(ex, "store get marker failed"); return null; }
+    }
+
+    // ---------- accounts（1.0.0-preview2 多账号存库） ----------
+
+    /// <summary>hello 绑定即 upsert（首见插、再见刷 LastSeen/桥型/版本/昵称）。</summary>
+    public async Task TouchAccountAsync(string uin, string? nickname, string bridge, string version)
+    {
+        if (uin.Length == 0) return;
+        await _writeLock.WaitAsync();
+        try
+        {
+            await using var db = await _factory.CreateDbContextAsync();
+            var existing = await db.Accounts.FindAsync(uin);
+            if (existing is null)
+            {
+                db.Accounts.Add(new AccountRecord
+                {
+                    Uin = uin,
+                    Nickname = nickname,
+                    Bridge = bridge,
+                    Version = version,
+                });
+            }
+            else
+            {
+                existing.LastSeenAt = DateTime.UtcNow;
+                existing.Bridge = bridge.Length > 0 ? bridge : existing.Bridge;
+                existing.Version = version.Length > 0 ? version : existing.Version;
+                if (!string.IsNullOrEmpty(nickname)) existing.Nickname = nickname;
+            }
+            await db.SaveChangesAsync();
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "store touch account failed"); }
+        finally { _writeLock.Release(); }
+    }
+
+    /// <summary>昵称 best-effort 刷新（hello 后自询 user.self_info）。</summary>
+    public async Task SetAccountNicknameAsync(string uin, string? nickname)
+    {
+        if (uin.Length == 0 || string.IsNullOrEmpty(nickname)) return;
+        await _writeLock.WaitAsync();
+        try
+        {
+            await using var db = await _factory.CreateDbContextAsync();
+            var existing = await db.Accounts.FindAsync(uin);
+            if (existing is null)
+                db.Accounts.Add(new AccountRecord { Uin = uin, Nickname = nickname });
+            else existing.Nickname = nickname;
+            await db.SaveChangesAsync();
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "store set account nickname failed"); }
+        finally { _writeLock.Release(); }
+    }
+
+    /// <summary>槽位断连记档（LastOfflineAt；账号仍留在已知清单）。</summary>
+    public async Task TouchAccountOfflineAsync(string uin)
+    {
+        if (uin.Length == 0) return;
+        await _writeLock.WaitAsync();
+        try
+        {
+            await using var db = await _factory.CreateDbContextAsync();
+            var existing = await db.Accounts.FindAsync(uin);
+            if (existing is not null)
+            {
+                existing.LastOfflineAt = DateTime.UtcNow;
+                await db.SaveChangesAsync();
+            }
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "store touch account offline failed"); }
+        finally { _writeLock.Release(); }
+    }
+
+    public async Task<List<AccountRecord>> ListAccountsAsync()
+    {
+        try
+        {
+            await using var db = await _factory.CreateDbContextAsync();
+            return await db.Accounts.OrderByDescending(a => a.LastSeenAt).ToListAsync();
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "store list accounts failed"); return new(); }
+    }
+
+    // ---------- reverse targets（1.0.0-preview2 反向端点存库 + 动态增删） ----------
+
+    public async Task<List<ReverseTargetRecord>> ListReverseTargetsAsync()
+    {
+        try
+        {
+            await using var db = await _factory.CreateDbContextAsync();
+            return await db.ReverseTargets.OrderBy(t => t.Id).ToListAsync();
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "store list reverse targets failed"); return new(); }
+    }
+
+    public async Task<ReverseTargetRecord?> GetReverseTargetAsync(long id)
+    {
+        try
+        {
+            await using var db = await _factory.CreateDbContextAsync();
+            return await db.ReverseTargets.FindAsync(id);
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "store get reverse target failed"); return null; }
+    }
+
+    public async Task<ReverseTargetRecord?> AddReverseTargetAsync(ReverseTargetRecord t)
+    {
+        await _writeLock.WaitAsync();
+        try
+        {
+            await using var db = await _factory.CreateDbContextAsync();
+            db.ReverseTargets.Add(t);
+            await db.SaveChangesAsync();
+            return t;
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "store add reverse target failed"); return null; }
+        finally { _writeLock.Release(); }
+    }
+
+    public async Task<bool> UpdateReverseTargetAsync(ReverseTargetRecord t)
+    {
+        await _writeLock.WaitAsync();
+        try
+        {
+            await using var db = await _factory.CreateDbContextAsync();
+            var existing = await db.ReverseTargets.FindAsync(t.Id);
+            if (existing is null) return false;
+            existing.Kind = t.Kind;
+            existing.Url = t.Url;
+            existing.AccessToken = t.AccessToken;
+            existing.SelfId = string.IsNullOrEmpty(t.SelfId) ? null : t.SelfId;
+            existing.ReconnectMs = t.ReconnectMs > 0 ? t.ReconnectMs : existing.ReconnectMs;
+            existing.Enabled = t.Enabled;
+            await db.SaveChangesAsync();
+            return true;
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "store update reverse target failed"); return false; }
+        finally { _writeLock.Release(); }
+    }
+
+    public async Task<bool> DeleteReverseTargetAsync(long id)
+    {
+        await _writeLock.WaitAsync();
+        try
+        {
+            await using var db = await _factory.CreateDbContextAsync();
+            var existing = await db.ReverseTargets.FindAsync(id);
+            if (existing is null) return false;
+            db.ReverseTargets.Remove(existing);
+            await db.SaveChangesAsync();
+            return true;
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "store delete reverse target failed"); return false; }
+        finally { _writeLock.Release(); }
+    }
+
+    /// <summary>seed：表空且 appsettings 配置非空 → 导入（一次性；之后表为唯一权威）。</summary>
+    public async Task<int> SeedReverseTargetsAsync(System.Collections.Generic.List<ReverseTargetRecord> records)
+    {
+        var added = 0;
+        await _writeLock.WaitAsync();
+        try
+        {
+            await using var db = await _factory.CreateDbContextAsync();
+            if (await db.ReverseTargets.AnyAsync()) return 0;
+            foreach (var r in records)
+            {
+                db.ReverseTargets.Add(r);
+                added++;
+            }
+            if (added > 0) await db.SaveChangesAsync();
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "store seed reverse targets failed"); }
+        finally { _writeLock.Release(); }
+        return added;
     }
 
     // ---------- clean_cache ----------

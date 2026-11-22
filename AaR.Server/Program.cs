@@ -16,6 +16,9 @@ builder.Services.AddSingleton<AaROptions>(_ =>
 builder.Services.Configure<ReverseOptions>(builder.Configuration.GetSection("AaR:Reverse"));
 builder.Services.AddSingleton<ReverseOptions>(_ =>
     builder.Configuration.GetSection("AaR:Reverse").Get<ReverseOptions>() ?? new ReverseOptions());
+// 1.0.0-preview2：反向端点权威 = aar.db ReverseTargets 表（appsettings 仅首次 seed）；
+// ReversePushService 订阅 manager 变更事件即时应用
+builder.Services.AddSingleton<ReverseEndpointManager>();
 builder.Services.AddHostedService<ReversePushService>();
 builder.Services.AddSingleton<BridgeRegistry>();
 builder.Services.AddSingleton<Ob11Store>();
@@ -56,7 +59,9 @@ var registry = app.Services.GetRequiredService<BridgeRegistry>();
 var ob11 = app.Services.GetRequiredService<Ob11Server>();
 var store = app.Services.GetRequiredService<Ob11Store>();
 var audit = app.Services.GetRequiredService<Ob11Audit>();
+var reverseManager = app.Services.GetRequiredService<ReverseEndpointManager>();
 await store.InitializeAsync(); // SQLite schema / 内存库锚连接 —— 在接受任何流量前完成
+await reverseManager.InitializeAsync(); // 反向端点 seed + 装载（幂等；ReversePushService 起动时同调用）
 
 // ---------- OB11 HTTP endpoints ----------
 // 标准 /:action 形态：POST/GET 均可（/api/{action} 与 /{action}），
@@ -137,7 +142,7 @@ app.MapGet("/{action}", async (HttpContext ctx, string action) =>
     IsReservedPath(action) ? Results.NotFound() : await HandleOb11Action(ctx, action));
 
 static bool IsReservedPath(string path) => path is
-    "hub" or "ws" or "health" or "api" or "negotiate" or "favicon.ico";
+    "hub" or "ws" or "health" or "api" or "negotiate" or "favicon.ico" or "ui";
 
 app.MapGet("/health", () => Results.Json(new
 {

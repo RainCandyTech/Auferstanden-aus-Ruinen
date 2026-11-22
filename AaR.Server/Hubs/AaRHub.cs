@@ -16,12 +16,17 @@ public class AaRHub : Hub
     private readonly Ob11Server _ob11;
     private readonly AaROptions _opts;
     private readonly ILogger<AaRHub> _logger;
+    private readonly IHubContext<AaRHub> _hubCtx;
+    private readonly Storage.Ob11Store _store;
 
-    public AaRHub(BridgeRegistry registry, Ob11Server ob11, AaROptions opts, ILogger<AaRHub> logger)
+    public AaRHub(BridgeRegistry registry, Ob11Server ob11, AaROptions opts,
+        IHubContext<AaRHub> hubCtx, Storage.Ob11Store store, ILogger<AaRHub> logger)
     {
         _registry = registry;
         _ob11 = ob11;
         _opts = opts;
+        _hubCtx = hubCtx;
+        _store = store;
         _logger = logger;
     }
 
@@ -75,6 +80,18 @@ public class AaRHub : Hub
                 try { await Clients.Client(displaced).SendAsync("InternalLog", "warn", "replaced by a newer connection for the same account"); }
                 catch { }
             }
+            // 1.0.0-preview2：绑定账号昵称自询（best-effort，补全账号档案；不阻 hello 路径）
+            try
+            {
+                using var doc = JsonDocument.Parse(payloadJson);
+                if (doc.RootElement.TryGetProperty("uin", out var u) &&
+                    (u.ValueKind == JsonValueKind.String || u.ValueKind == JsonValueKind.Number) &&
+                    u.GetString() is { Length: > 0 } huin)
+                {
+                    _ = Task.Run(() => RefreshAccountNicknameAsync(huin));
+                }
+            }
+            catch { }
             return;
         }
         // 1.0.0-preview1：headless 桥的登录面透出（WebUI 扫码卡片）——
@@ -98,6 +115,21 @@ public class AaRHub : Hub
 
     public void InternalLog(string level, string line)
         => _logger.Log(LogLevelFrom(level), "[bridge] {Line}", line);
+
+    /// <summary>1.0.0-preview2：hello 绑定账号的昵称自询（定向 targetUin 的 kernel RPC）。</summary>
+    private async Task RefreshAccountNicknameAsync(string uin)
+    {
+        try
+        {
+            var (ok, data, _) = await _registry.CallJsonAsync(_hubCtx, "user.self_info", null, targetUin: uin);
+            if (!ok || data is null) return;
+            var nick = data.Value.TryGetProperty("nick", out var nv) &&
+                       nv.ValueKind == JsonValueKind.String ? nv.GetString() : null;
+            if (!string.IsNullOrEmpty(nick))
+                await _store.SetAccountNicknameAsync(uin, nick);
+        }
+        catch { /* best-effort：昵称缺失不影响账号档案 */ }
+    }
 
     private static LogLevel LogLevelFrom(string level) => level switch
     {

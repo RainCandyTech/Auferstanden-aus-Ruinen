@@ -68,14 +68,16 @@ public sealed class BridgeRegistry
     private readonly ConcurrentDictionary<string, BridgeSlot> _slots = new();   // connectionId -> slot
     private readonly ConcurrentDictionary<string, string> _byUin = new();       // uin -> connectionId
     private readonly ILogger<BridgeRegistry> _logger;
+    private readonly Storage.Ob11Store _store;                                  // 1.0.0-preview2：账号档案存库
     private volatile string? _legacyConnectionId;      // 无握手身份的连接（今日单桥）
     private volatile string? _primarySlotConnectionId; // 缺省路由：首个绑定的身份槽
     private AaROptions _opts;
 
-    public BridgeRegistry(ILogger<BridgeRegistry> logger, AaROptions opts)
+    public BridgeRegistry(ILogger<BridgeRegistry> logger, AaROptions opts, Storage.Ob11Store store)
     {
         _logger = logger;
         _opts = opts;
+        _store = store;
     }
 
     public bool IsBridgeConnected => _legacyConnectionId is not null || !_slots.IsEmpty;
@@ -141,6 +143,8 @@ public sealed class BridgeRegistry
                 slot.LoginQrUrl = null;
                 slot.LoginQrPng = null;
                 var existing = _byUin.GetOrAdd(uin, connectionId);
+                // 1.0.0-preview2：绑定即落账号档案（跨重启存活；fire-and-forget 不阻 hello 路径）
+                _ = _store.TouchAccountAsync(uin, null, slot.Bridge, slot.Version);
                 if (existing != connectionId && _byUin.TryUpdate(uin, connectionId, existing))
                 {
                     _logger.LogInformation("bridge slot bound: {Conn} uin={Uin} (displacing {Old})",
@@ -171,7 +175,11 @@ public sealed class BridgeRegistry
         {
             if (slot.Uin is { Length: > 0 } uin &&
                 _byUin.TryGetValue(uin, out var bound) && bound == connectionId)
+            {
                 _byUin.TryRemove(uin, out _);
+                // 1.0.0-preview2：槽位离线记档（账号仍留已知清单）
+                _ = _store.TouchAccountOfflineAsync(uin);
+            }
             if (_primarySlotConnectionId == connectionId)
                 _primarySlotConnectionId = _slots.Keys.FirstOrDefault();
             _logger.LogWarning("bridge slot disconnected: {Conn} uin={Uin}", connectionId, slot.Uin ?? "-");

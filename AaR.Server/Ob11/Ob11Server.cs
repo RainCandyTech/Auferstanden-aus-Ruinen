@@ -29,7 +29,7 @@ public class Ob11Server
     public volatile string SelfNick = "";
 
     /// <summary>Server version reported by get_version_info and the #AaR debug command.</summary>
-    public const string ServerVersion = "1.0.0-preview1";
+    public const string ServerVersion = "1.0.0-preview2";
 
     // msgId -> "chatType|peerUid|seq" for delete_msg / get_msg / reply building
     private readonly ConcurrentDictionary<string, string> _msgIndex = new();
@@ -82,6 +82,9 @@ public class Ob11Server
     // connected OB11 WS clients (forward ws) + per-client mode (standard /api /event / universal)
     private readonly ConcurrentDictionary<string, System.Net.WebSockets.WebSocket> _wsClients = new();
     private readonly ConcurrentDictionary<string, WsClientMode> _wsModes = new();
+    // 1.0.0-preview2：/ws/{uin} 账号绑定连接——只收 self_id=绑定账号的事件；
+    // 未绑（旧 /ws 路径）= 全量推送（0.8.0 兼容）
+    private readonly ConcurrentDictionary<string, string?> _wsBoundUin = new();
     private DateTime _startedAt = DateTime.UtcNow;
 
     public Ob11Server(BridgeRegistry bridge, AaROptions opts, ILogger<Ob11Server> logger, IHubContext<AaRHub> hub, Storage.Ob11Store store)
@@ -108,10 +111,13 @@ public class Ob11Server
     /// <summary>Forward-WS client capability: 标准 /api /event 分路与 universal 全能。</summary>
     public enum WsClientMode { Universal, Api, Event }
 
-    public void RegisterWsClient(string id, System.Net.WebSockets.WebSocket ws, WsClientMode mode = WsClientMode.Universal)
+    /// <summary>Forward-WS client capability: 标准 /api /event 分路与 universal 全能。
+    /// boundUin（1.0.0-preview2）：/ws/{uin} 连接的账号绑定——事件按 self_id 过滤。</summary>
+    public void RegisterWsClient(string id, System.Net.WebSockets.WebSocket ws, WsClientMode mode = WsClientMode.Universal, string? boundUin = null)
     {
         _wsClients[id] = ws;
         _wsModes[id] = mode;
+        _wsBoundUin[id] = boundUin;
         _wsSendLocks.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
     }
 
@@ -119,6 +125,7 @@ public class Ob11Server
     {
         _wsClients.TryRemove(id, out _);
         _wsModes.TryRemove(id, out _);
+        _wsBoundUin.TryRemove(id, out _);
         if (_wsSendLocks.TryRemove(id, out var l)) l.Dispose();
     }
 
@@ -2137,6 +2144,8 @@ public class Ob11Server
         catch (Exception ex) { _logger.LogWarning(ex, "event subscriber failed (isolated)"); }
 
         var bytes = System.Text.Encoding.UTF8.GetBytes(json);
+        // 事件归因账号（NormalizeIdFields 已把 self_id 规整为字符串；缺 = 无法归因）
+        var evtSelfId = evt.TryGetValue("self_id", out var sv) ? sv?.ToString() : null;
         foreach (var kv in _wsClients)
         {
             var ws = kv.Value;
@@ -2145,6 +2154,10 @@ public class Ob11Server
                 if (ws.State != System.Net.WebSockets.WebSocketState.Open) { RemoveWsClient(kv.Key); continue; }
                 // /api 专用连接不收事件（标准：事件只推 universal/event 连接）
                 if (_wsModes.TryGetValue(kv.Key, out var m) && m == WsClientMode.Api) continue;
+                // 1.0.0-preview2：/ws/{uin} 绑定连接只收本账号事件；
+                // 未绑连接全量（0.8.0 兼容）；事件无 self_id 时不过滤（无法归因则全推）
+                if (_wsBoundUin.TryGetValue(kv.Key, out var bound) && !string.IsNullOrEmpty(bound) &&
+                    evtSelfId is not null && bound != evtSelfId) continue;
                 // per-connection send lock: parallel WebSocket.SendAsync on one socket
                 // throws InvalidOperationException and would drop the client
                 await SendWsFrameAsync(kv.Key, ws, bytes);

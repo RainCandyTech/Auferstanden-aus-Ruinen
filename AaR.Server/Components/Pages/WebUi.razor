@@ -4,6 +4,7 @@
 @inject BridgeRegistry Registry
 @inject Ob11Audit Audit
 @inject AaROptions Opts
+@inject AaR.Server.Storage.Ob11Store Store
 @inject NavigationManager Nav
 
 @if (_authFailed)
@@ -113,13 +114,43 @@ else
                         </div>
                         <div class="qrmeta">
                             <div>更新于 @p["qr_at"]</div>
-                            <div style="margin-top:8px;"><FluentAnchor Href="@(p["qr_url"] as string)" Target="_blank">浏览器打开二维码</FluentAnchor></div>
+                            <div style="margin-top:8px;"><a href="@(p["qr_url"] as string)" target="_blank" rel="noopener">浏览器打开二维码</a></div>
                             <div style="margin-top:8px;word-break:break-all;">@(p["qr_url"])</div>
                         </div>
                     }
                 </div>
             </div>
         </FluentCard>
+    }
+
+    <h2>已知账号（存库）</h2>
+    @if (_accounts.Count == 0)
+    {
+        <FluentCard><div class="muted" style="padding:16px;text-align:center;">尚无账号档案——桥 hello 绑定后自动建档（跨重启存活）</div></FluentCard>
+    }
+    else
+    {
+        <FluentCard Style="padding:4px;">
+            <table>
+                <thead><tr><th>状态</th><th>账号</th><th>昵称</th><th>桥型</th><th>版本</th><th>最近绑定</th><th>最近离线</th></tr></thead>
+                <tbody>
+                    @foreach (var a in _accounts)
+                    {
+                        var online = _boundUins.Contains(a.Uin);
+                        <tr>
+                            <td><span style="color:@(online ? "var(--accent-fill-rest)" : "var(--neutral-foreground-rest)");opacity:@(online ? "1" : ".55");">@(online ? "在线" : "离线")</span></td>
+                            <td>@a.Uin</td>
+                            <td>@(string.IsNullOrEmpty(a.Nickname) ? "-" : a.Nickname)</td>
+                            <td>@a.Bridge</td>
+                            <td class="muted">@a.Version</td>
+                            <td class="muted">@a.LastSeenAt.ToString("MM-dd HH:mm")</td>
+                            <td class="muted">@(a.LastOfflineAt?.ToString("MM-dd HH:mm") ?? "-")</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </FluentCard>
+        <p class="muted" style="margin:8px 0 0;">正向 WS 账号路径：ws://&lt;host&gt;:5600/ws/&lt;uin&gt;（如 /ws/@(_accounts.Count > 0 ? _accounts[0].Uin : "3774879303")）——仅收该账号事件，调用默认路由到该账号槽</p>
     }
 }
 
@@ -129,6 +160,8 @@ else
     private List<Ob11Audit.Call> _recent = new();
     private int _boundCount;
     private List<Dictionary<string, object?>> _pendingQr = new();
+    private List<AaR.Server.Storage.AccountRecord> _accounts = new();
+    private HashSet<string> _boundUins = new(StringComparer.Ordinal);
     private string _uptime = "-";
     private DateTime _procStart = DateTime.Now;
     private PeriodicTimer? _timer;
@@ -144,7 +177,14 @@ else
         }
         try { _procStart = System.Diagnostics.Process.GetCurrentProcess().StartTime; } catch { }
         Load();
+        _ = LoadAccountsOnceAsync();
         _ = RefreshLoopAsync();
+    }
+
+    private async Task LoadAccountsOnceAsync()
+    {
+        _accounts = await Store.ListAccountsAsync();
+        await InvokeAsync(StateHasChanged);
     }
 
     private async Task RefreshLoopAsync()
@@ -153,6 +193,7 @@ else
         while (await _timer.WaitForNextTickAsync())
         {
             Load();
+            await LoadAccountsAsync();
             StateHasChanged();
         }
     }
@@ -163,7 +204,20 @@ else
         _recent = Audit.Recent(40).OrderByDescending(c => c.At).ToList();
         _boundCount = _overview.Count(s => s["state"] as string == "bound");
         _pendingQr = _overview.Where(s => s["state"] as string == "pending" && !string.IsNullOrEmpty(s["qr_url"] as string)).ToList();
+        _boundUins = _overview
+            .Where(s => s["state"] as string == "bound" && s["uin"] is string u && u.Length > 0)
+            .Select(s => (string)s["uin"]!)
+            .ToHashSet(StringComparer.Ordinal);
         var up = DateTime.Now - _procStart;
         _uptime = up.TotalHours >= 1 ? $"{(int)up.TotalHours} 时 {up.Minutes} 分" : $"{up.Minutes} 分 {up.Seconds} 秒";
+    }
+
+    /// <summary>账号档案是 SQLite 读，走独立 async 拍（每 5s 一次，与 2s 槽位拍错开）。</summary>
+    private int _accountsTick;
+
+    private async Task LoadAccountsAsync()
+    {
+        if (++_accountsTick % 3 != 1) return; // 2s × 3 ≈ 6s 一拍
+        _accounts = await Store.ListAccountsAsync();
     }
 }

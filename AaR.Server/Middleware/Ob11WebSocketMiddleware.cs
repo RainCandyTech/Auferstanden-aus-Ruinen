@@ -11,6 +11,13 @@ namespace AaR.Server.Middleware;
 ///   {Ob11WsPath}/api        → 仅 API
 ///   {Ob11WsPath}/event      → 仅事件推送（收到的 API 请求被忽略）
 /// 客户端发送 {"action","params","echo"}，得到 {"status","retcode","data","echo"}。
+/// 1.0.0-preview2 多账号路径族（单账号传输的账号区分——URL 路由）：
+///   {Ob11WsPath}/{uin}          → 绑定账号 universal：只收 self_id={uin} 的事件，
+///                                  该连接的 API 调用默认路由到 {uin} 槽（显式 self_id 优先）
+///   {Ob11WsPath}/{uin}/api      → 同上，仅 API
+///   {Ob11WsPath}/{uin}/event    → 同上，仅事件
+///   旧路径（无 uin 段）= 全量推送 + 缺省主槽路由（0.8.0 兼容，语义不变）。
+///   uin 段必须纯数字（与 /api /event 保留字互斥）。
 /// </summary>
 public class Ob11WebSocketMiddleware
 {
@@ -30,20 +37,40 @@ public class Ob11WebSocketMiddleware
         var basePath = _opts.Ob11WsPath.TrimEnd('/');
         var path = ctx.Request.Path.Value ?? "";
 
+        if (!path.StartsWith(basePath, StringComparison.OrdinalIgnoreCase)) { await next(ctx); return; }
+        var suffix = path[basePath.Length..].TrimStart('/').TrimEnd('/');
+        var parts = suffix.Length == 0
+            ? Array.Empty<string>()
+            : suffix.Split('/', StringSplitOptions.RemoveEmptyEntries);
+
         Ob11Server.WsClientMode mode;
-        if (path.Equals(basePath, StringComparison.OrdinalIgnoreCase) ||
-            path.Equals(basePath + "/", StringComparison.OrdinalIgnoreCase))
-            mode = Ob11Server.WsClientMode.Universal;
-        else if (path.Equals(basePath + "/api", StringComparison.OrdinalIgnoreCase) ||
-                 path.Equals(basePath + "/api/", StringComparison.OrdinalIgnoreCase))
-            mode = Ob11Server.WsClientMode.Api;
-        else if (path.Equals(basePath + "/event", StringComparison.OrdinalIgnoreCase) ||
-                 path.Equals(basePath + "/event/", StringComparison.OrdinalIgnoreCase))
-            mode = Ob11Server.WsClientMode.Event;
-        else
+        string? boundUin = null;
+        switch (parts.Length)
         {
-            await next(ctx);
-            return;
+            case 0:
+                mode = Ob11Server.WsClientMode.Universal;
+                break;
+            case 1 when parts[0].Equals("api", StringComparison.OrdinalIgnoreCase):
+                mode = Ob11Server.WsClientMode.Api;
+                break;
+            case 1 when parts[0].Equals("event", StringComparison.OrdinalIgnoreCase):
+                mode = Ob11Server.WsClientMode.Event;
+                break;
+            case 1 when IsUin(parts[0]):
+                mode = Ob11Server.WsClientMode.Universal;
+                boundUin = parts[0];
+                break;
+            case 2 when IsUin(parts[0]) && parts[1].Equals("api", StringComparison.OrdinalIgnoreCase):
+                mode = Ob11Server.WsClientMode.Api;
+                boundUin = parts[0];
+                break;
+            case 2 when IsUin(parts[0]) && parts[1].Equals("event", StringComparison.OrdinalIgnoreCase):
+                mode = Ob11Server.WsClientMode.Event;
+                boundUin = parts[0];
+                break;
+            default:
+                await next(ctx);
+                return;
         }
 
         var auth = AaRAuth.Check(ctx, _opts);
@@ -71,14 +98,14 @@ public class Ob11WebSocketMiddleware
         // register before the first send so the lifecycle frame and every later
         // frame share the server-side per-connection send lock
         var clientId = Guid.NewGuid().ToString("N");
-        _ob11.RegisterWsClient(clientId, ws, mode);
+        _ob11.RegisterWsClient(clientId, ws, mode, boundUin);
         // P1-1: late-connecting clients must receive lifecycle connect immediately
         try
         {
             var connectEvt = new Dictionary<string, object?>
             {
                 ["time"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                ["self_id"] = _ob11.SelfUin,
+                ["self_id"] = boundUin ?? _ob11.SelfUin,
                 ["post_type"] = "meta_event",
                 ["meta_event_type"] = "lifecycle",
                 ["sub_type"] = "connect",
@@ -87,7 +114,7 @@ public class Ob11WebSocketMiddleware
             await _ob11.SendWsFrameAsync(clientId, ws, connectBytes);
         }
         catch { }
-        _logger.LogInformation("ob11 ws client connected: {Id} mode={Mode}", clientId, mode);
+        _logger.LogInformation("ob11 ws client connected: {Id} mode={Mode} bound={Uin}", clientId, mode, boundUin ?? "-");
 
         var buffer = new byte[1024 * 256];
         try
@@ -111,7 +138,7 @@ public class Ob11WebSocketMiddleware
                 var text = Encoding.UTF8.GetString(ms.ToArray());
                 // /event 专用连接不提供 API（标准：需要 API 用 /api 或 universal）
                 if (mode == Ob11Server.WsClientMode.Event) continue;
-                _ = HandleClientFrameAsync(clientId, ws, text);
+                _ = HandleClientFrameAsync(clientId, ws, text, boundUin);
             }
         }
         catch (OperationCanceledException) { }
@@ -123,7 +150,7 @@ public class Ob11WebSocketMiddleware
         }
     }
 
-    private async Task HandleClientFrameAsync(string clientId, WebSocket ws, string text)
+    private async Task HandleClientFrameAsync(string clientId, WebSocket ws, string text, string? boundUin)
     {
         JsonElement? echoRaw = null;
         string? echo = null;
@@ -141,6 +168,9 @@ public class Ob11WebSocketMiddleware
             if (root.TryGetProperty("params", out var ps) && ps.ValueKind == JsonValueKind.Object)
                 foreach (var prop in ps.EnumerateObject())
                     p[prop.Name] = prop.Value.Clone();
+            // 1.0.0-preview2：/ws/{uin} 绑定连接的 API 调用默认路由到绑定槽
+            //   （TryAdd 语义——调用方显式 self_id 优先；与反向 WS 绑定 0.8.1 同口径）
+            if (!string.IsNullOrEmpty(boundUin)) p.TryAdd("self_id", boundUin);
 
             var response = await _ob11.HandleActionAsync(action, p, echo, echoRaw);
             await SendAsync(clientId, ws, response.ToJson());
@@ -159,4 +189,8 @@ public class Ob11WebSocketMiddleware
         // shared per-connection lock: responses race with event broadcasts
         await _ob11.SendWsFrameAsync(clientId, ws, bytes);
     }
+
+    /// <summary>uin 路径段：纯数字且非零长度（与 /api /event 保留字互斥）。</summary>
+    private static bool IsUin(string s) =>
+        s.Length > 0 && s.Length <= 20 && s.All(char.IsAsciiDigit);
 }

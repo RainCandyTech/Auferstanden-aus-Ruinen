@@ -2,8 +2,10 @@
 @rendermode InteractiveServer
 @using System.Web
 @using AaR.Server.Ob11
+@using AaR.Server.Services
 @inject AaROptions Opts
 @inject Ob11Audit Audit
+@inject ReverseEndpointManager ReverseMgr
 @inject NavigationManager Nav
 @inject IThemeService Theme
 
@@ -55,6 +57,53 @@ else
         </table>
     </FluentCard>
 
+    <h2>反向端点（存库 · 动态应用）</h2>
+    <p class="sub">事件推送目标（反向 WS / HTTP POST）——增删启停即时生效；配置存 aar.db，appsettings 仅作首次 seed</p>
+    <FluentCard Style="padding:4px;">
+        @if (_targets.Count == 0)
+        {
+            <div class="muted" style="padding:16px;text-align:center;">尚无反向端点</div>
+        }
+        else
+        {
+            <table>
+                <thead><tr><th>#</th><th>类型</th><th>URL</th><th>绑定账号</th><th>状态</th><th>操作</th></tr></thead>
+                <tbody>
+                    @foreach (var t in _targets)
+                    {
+                        <tr>
+                            <td class="muted">@t.Id</td>
+                            <td>@t.Kind</td>
+                            <td style="word-break:break-all;max-width:360px;">@t.Url</td>
+                            <td>@(string.IsNullOrEmpty(t.SelfId) ? "全量" : t.SelfId)</td>
+                            <td><span style="color:@(t.Enabled ? "var(--accent-fill-rest)" : "var(--error)");">@(t.Enabled ? "启用" : "停用")</span></td>
+                            <td>
+                                <div class="row" style="gap:6px;">
+                                    <FluentButton OnClick="@(() => _ = ToggleTargetAsync(t.Id, !t.Enabled))">@(_busyId == t.Id ? "…" : (t.Enabled ? "停用" : "启用"))</FluentButton>
+                                    <FluentButton OnClick="@(() => _ = RemoveTargetAsync(t.Id))">删除</FluentButton>
+                                </div>
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+    </FluentCard>
+
+    <div class="row" style="margin-top:10px;">
+        <select @bind="_newKind" style="width:80px;">
+            <option value="ws">ws</option>
+            <option value="http">http</option>
+        </select>
+        <input type="text" @bind="_newUrl" placeholder="ws://host:port/onebot/v11/ws（或 http://host/onebot）" style="min-width:320px;" />
+        <input type="text" @bind="_newToken" placeholder="访问令牌（可空）" style="min-width:140px;" />
+        <input type="text" @bind="_newSelfId" placeholder="绑定 uin（可空=全量）" style="min-width:150px;" />
+        <input type="number" @bind="_newReconnect" style="width:90px;" />
+        <FluentButton Appearance="ButtonAppearance.Primary" OnClick="@AddTargetAsync">添加</FluentButton>
+        <span class="muted">@_newStatus</span>
+    </div>
+    <p class="sub" style="margin-top:6px;">管理面仅经 WebUI（页面 access_token gate）；端点集存 aar.db ReverseTargets 表，服务重启后自动恢复连接</p>
+
     <h2>主题</h2>
     <div class="row">
         <FluentButton OnClick="@(() => ToggleThemeAsync())">@(_dark ? "切换到亮色" : "切换到暗色")</FluentButton>
@@ -69,6 +118,16 @@ else
     private long _mem;
     private DateTime _procStart = DateTime.Now;
     private PeriodicTimer? _timer;
+
+    // 反向端点管理（1.0.0-preview2）
+    private IReadOnlyList<ReverseTargetView> _targets = Array.Empty<ReverseTargetView>();
+    private string _newKind = "ws";
+    private string _newUrl = "";
+    private string _newToken = "";
+    private string _newSelfId = "";
+    private int _newReconnect = 5000;
+    private string _newStatus = "";
+    private long _busyId;
 
     protected override void OnInitialized()
     {
@@ -99,6 +158,39 @@ else
         var up = DateTime.Now - _procStart;
         _uptime = up.TotalHours >= 1 ? $"{(int)up.TotalHours} 时 {up.Minutes} 分" : $"{up.Minutes} 分 {up.Seconds} 秒";
         try { _mem = System.Diagnostics.Process.GetCurrentProcess().WorkingSet64 / 1024 / 1024; } catch { }
+        _targets = ReverseMgr.Current;   // 快照直读（变更即刷，无库往返）
+    }
+
+    private async Task AddTargetAsync()
+    {
+        _newStatus = "添加中…";
+        var added = await ReverseMgr.AddAsync(_newKind, _newUrl, _newToken, _newSelfId, _newReconnect);
+        if (added is null)
+        {
+            _newStatus = "添加失败：类型须为 ws/http，URL 须为合法绝对地址";
+            return;
+        }
+        _newStatus = $"已添加 #{added.Id}（即时生效）";
+        _newUrl = ""; _newToken = ""; _newSelfId = "";
+        Load();
+    }
+
+    private async Task ToggleTargetAsync(long id, bool enable)
+    {
+        _busyId = id;
+        await ReverseMgr.SetEnabledAsync(id, enable);
+        _busyId = 0;
+        Load();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task RemoveTargetAsync(long id)
+    {
+        _busyId = id;
+        await ReverseMgr.RemoveAsync(id);
+        _busyId = 0;
+        Load();
+        await InvokeAsync(StateHasChanged);
     }
 
     private async Task ToggleThemeAsync()

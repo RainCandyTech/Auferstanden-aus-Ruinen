@@ -7,9 +7,9 @@ AaR 从废墟中站起，接过了这个位置。
 
 ---
 
-### 欢迎使用 Auferstanden aus Ruinen V1.0.0 Preview 1 ！
+### 欢迎使用 Auferstanden aus Ruinen V1.0.0 Preview 2 ！
 
-V1.0.0 Preview 1 里程碑：
+V1.0.0 Preview 2 里程碑：
 
 |里程碑|达成版本/目标版本|
 |--|--|
@@ -19,6 +19,7 @@ V1.0.0 Preview 1 里程碑：
 |~~Native桥接器基线版本~~|~~V1.0.0-preview1~~|
 |Headless桥接器|V0.9.0 OK|
 |WebUI管理面板|V1.0.0-preview1 OK|
+|正向WS账号路径与账号/反向端点存库管理|V1.0.0-preview2 OK|
 
 更多里程碑：
 
@@ -33,7 +34,7 @@ V1.0.0 Preview 1 里程碑：
 
 |问题|状态|缓解措施|
 |--|--|--|
-|在正向WS+多QQ连接到一个AaR主控的情况下，上报ID只会回退到一个QQ，发送消息同理|不会修复|请运行多个AaR主控|
+|~~在正向WS+多QQ连接到一个AaR主控的情况下，上报ID只会回退到一个QQ，发送消息同理~~|已解决（V1.0.0-preview2：`/ws/{uin}` 账号路径族——事件过滤 + 调用定向）|旧 `/ws` 全量语义保留兼容；多账号 bot 请连接 `/ws/{uin}`|
 |CQ码的解析可能出现问题|不会修复|请避免使用CQ码|
 
 ---
@@ -59,7 +60,7 @@ AaR 是面向 **QQ NT Linux 客户端（3.2.x）** 的 OneBot v11 协议端实�
 |---|---|---|
 | **AaR.Server** | .NET 二进制 | OneBot v11 协议端本体：全部协议逻辑、传输通道、事件转换、对外接口 |
 | **JS 桥** | JavaScript（**0.4.1 起明文分发**） | 运行于 QQ NT 主进程内部，**仅**将 RPC 调用转换为客户端内核函数调用、推送内核事件。不含任何协议逻辑 |
-| **Headless 桥** ⚠️ 预研中（0.9.0 里程碑） | .NET 宿主 + LibNode 内嵌 Node（L4 契约） | 进程外自起 .NET 宿主，经 [node-api-dotnet](https://github.com/microsoft/node-api-dotnet) 的 LibNode 直载 QQ 内核 `wrapper.node`，自管扫码登录——无需运行 QQ 客户端、不注入、不修改 QQ 安装文件。契约规范见 `docs/l4-contract-v1.md`（core-v1 + 扩展组 + 多账号槽位）。挂机 JS 桥仍是生产基线 |
+| **Headless 桥**（0.9.0 已达成） | .NET 宿主 + LibNode 内嵌 Node（L4 契约） | 进程外自起 .NET 宿主，经 [node-api-dotnet](https://github.com/microsoft/node-api-dotnet) 的 LibNode 直载 QQ 内核 `wrapper.node`，自管扫码登录——无需运行 QQ 客户端、不注入、不修改 QQ 安装文件。契约规范见 `docs/l4-contract-v1.md`（core-v1 + 扩展组 + 多账号槽位）。挂机 JS 桥仍是生产基线 |
 
 协议端与桥接模块之间通过 SignalR 双向 RPC 通信。桥接模块对协议一无所知——
 这一隔离是刻意设计的。JS 桥自 0.4.1 起以明文分发（此前为混淆分发）；
@@ -87,8 +88,14 @@ QQ NT Linux 的多账号形态是**多进程**（每账号一个 QQ 进程，各
 4. **反向 WS 一 bot 一连接**（v0.8.1）：`Reverse.WebSockets` 的每个目标
    可用 `"selfId"` 绑定账号——该连接只收该账号的事件，其回传的 API
    调用默认路由到绑定账号。未绑定的目标保持全量推送（兼容行为）；
-5. **正向 WS 多 bot**：不做专门处理——事件已带 `self_id`，客户端按
-   `self_id` 自行分流。
+   v1.0.0-preview2 起端点存库（aar.db）并经 WebUI 动态增删/启停，即时生效；
+5. **正向 WS 账号路径**（v1.0.0-preview2）：`/ws/{uin}`、`/ws/{uin}/api`、
+   `/ws/{uin}/event`——绑定连接只收该账号的事件，其 API 调用默认路由到
+   该账号槽（显式 `self_id` 传参优先）；旧路径 `/ws` 等保持全量推送
+   （兼容行为，单账号用户零感知）；
+6. **账号档案存库**（v1.0.0-preview2）：hello 绑定即入 aar.db `Accounts`
+   表（昵称经定向自询补全、桥型/版本、最近绑定与离线时间），跨重启存活，
+   WebUI 总览「已知账号」表可视。
 
 ## OneBot v11 接口面
 
@@ -97,9 +104,9 @@ QQ NT Linux 的多账号形态是**多进程**（每账号一个 QQ 进程，各
 | 通道 | 方向 | 说明 |
 |---|---|---|
 | 正向 HTTP | 框架 → AaR | `POST /api/{action}`，兼容 `POST /{action}` 与 GET 查询串 |
-| 正向 WebSocket | 框架 ↔ AaR | `/ws`，事件直推 + 同连接 API 调用，连接即补发 `lifecycle connect` |
-| 反向 WebSocket | AaR → 框架 | AaR 作为 WS 客户端连出，携带 `X-Self-ID` / `X-Client-Role` 头，同连接双向；v0.8.1 起目标可用 `selfId` 绑定账号（一 bot 一连接，事件过滤 + 回传 API 按绑定账号路由） |
-| 反向 HTTP POST | AaR → 框架 | 事件上报（`X-Self-ID` 头），上游 2xx 响应体可携带 API 调用数组，AaR 执行 |
+| 正向 WebSocket | 框架 ↔ AaR | `/ws`（全量），v1.0.0-preview2 起新增账号路径 `/ws/{uin}`（绑定连接只收该账号事件、调用默认路由该账号）；`/api`、`/event` 分路变体同样支持 `{uin}` 段；连接即补发 `lifecycle connect` |
+| 反向 WebSocket | AaR → 框架 | AaR 作为 WS 客户端连出，携带 `X-Self-ID` / `X-Client-Role` 头，同连接双向；目标可用 `selfId` 绑定账号（一 bot 一连接）。v1.0.0-preview2 起端点存库，WebUI 设置页动态增删/启停，即时生效 |
+| 反向 HTTP POST | AaR → 框架 | 事件上报（`X-Self-ID` 头），上游 2xx 响应体可携带 API 调用数组，AaR 执行；存库动态管理同上 |
 
 ### 已实现 action
 
@@ -152,20 +159,23 @@ AaR.Server 读取同目录 `appsettings.json` 的 `AaR` 段：
   "AaR": {
     "AccessToken": "",              // 留空 = 不鉴权；建议公网部署前设置
     "BridgeHubPath": "/hub/aar",    // 桥接模块连接端点
-    "Ob11WsPath": "/ws",            // 正向 WS 端点
+    "Ob11WsPath": "/ws",            // 正向 WS 端点（/ws、/ws/api、/ws/event 及 /ws/{uin} 账号变体）
     "BridgeTimeoutMs": 15000,       // 内核 RPC 超时
     "HeartbeatIntervalMs": 30000,   // 心跳间隔
     "RequireBridgeForHttp": true,   // 桥接未连接时 HTTP API 返回 503（不再是无用的死配置）
     "EnableDebugCommand": true,     // #AaR 聊天调试命令（见下文）；设为 false 可关闭
     "EnableDebugKernel": false,     // debug_kernel 诊断透传（默认关闭）
-    "Storage": {                    // 消息/媒体/uid 索引持久化（v0.5.0 起）
+    "Storage": {                    // 消息/媒体/uid 索引持久化（v0.5.0 起）；
+                                     // v1.0.0-preview2 起同库含账号档案（Accounts）与
+                                     // 反向端点（ReverseTargets）两张表
       "Provider": "sqlite",
       "Path": "data/aar.db"
     },
     "Reverse": {
+      // v1.0.0-preview2：本段仅作首次启动 seed（表空时导入 aar.db），
+      // 之后以库表为唯一权威——经 WebUI 设置页动态增删/启停，即时生效；
+      // WS 目标的 selfId 绑定语义与 v0.8.1 一致（一 bot 一连接）
       "WebSockets": [               // 反向 WS 目标（框架侧 WS 服务地址）
-        // v0.8.1：多 bot 一 bot 一连接——selfId 绑定账号后该连接只收该账号
-        // 事件、回传 API 默认路由绑定账号；省略 selfId = 全量（兼容）
         { "Url": "ws://127.0.0.1:8080/onebot/v11/ws", "AccessToken": "", "SelfId": "3774879303" },
         { "Url": "ws://127.0.0.1:8081/onebot/v11/ws", "AccessToken": "", "SelfId": "2074696141" }
       ],
@@ -179,6 +189,21 @@ AaR.Server 读取同目录 `appsettings.json` 的 `AaR` 段：
 
 日志与运行数据写在同目录。桥接模块侧有独立的 `aar-config.json`
 （服务器地址与令牌），与 AaR.Server 的 `AccessToken` 保持一致。
+
+## WebUI 管理面板（v1.0.0-preview1+）
+
+浏览器打开 `http://<host>:5600/ui`（配置了 `AccessToken` 时携带
+`?access_token=<token>`），服务端自带控制台：
+
+| 页 | 内容 |
+|---|---|
+| 总览 | 状态卡（桥接/槽位/OB11 调用累计与失败/运行时长）+ 最近调用审计（动作/retcode 红绿/耗时）+ 在线槽位 + headless 待扫码登录卡 + **已知账号表（v1.0.0-preview2，存库跨重启）** |
+| 调试台 | OB11 动作直调：预设模板 + 参数 JSON 编辑 + 服务端内环（与 HTTP 同一代码路径，不绕鉴权）+ envelope 原文回显 |
+| 日志 | 全宿主日志实时尾随（环形 3000 条，WARN/ERROR 筛选 + 搜索 + 暂停） |
+| 设置 | 运行时摘要（版本/内存/配置脱敏）+ 明暗切换（浏览器记忆）+ **反向端点管理（v1.0.0-preview2：列表/添加/启停/删除，即时生效）** |
+
+headless 桥接入新账号全程可视：登录期以 pending 槽先连，二维码经
+`login_qr` 透出至总览页扫码卡。
 
 ## 聊天调试命令 `#AaR`
 
@@ -205,11 +230,12 @@ QQ NT 的入口解析链路（`package.json` 主字段、`app_launcher` 与内�
 JS 桥具备自动重连与内核会话自愈能力；QQ 重启、登录状态变化、AaR.Server
 重启均不需要人工干预。
 
-Headless 桥接器（0.9.0 里程碑，预研中）：AaR.Server 之外每账号一个 .NET
+Headless 桥接器（0.9.0 里程碑已达成）：AaR.Server 之外每账号一个 .NET
 宿主进程，内嵌 Node 运行时直载 QQ 内核——不运行 QQ 客户端、不注入、不修改
-QQ 安装文件，扫码登录自管，登录面经服务端透出。历史上的 Native Hook 桥
-（0.4.x 实验性 `LD_PRELOAD` 形态）已取消——Native 发送路径考古结论入档，
-方向改判 Headless（Native 发送要解决的问题在允许桥内有 JS 后不复存在）。
+QQ 安装文件，扫码登录自管（票据存 mmkv 跨硬杀存活，重启免扫码），登录面
+经服务端透出。历史上的 Native Hook 桥（0.4.x 实验性 `LD_PRELOAD` 形态）已
+取消——Native 发送路径考古结论入档，方向改判 Headless（Native 发送要解决
+的问题在允许桥内有 JS 后不复存在）。
 
 ## 兼容性备忘
 

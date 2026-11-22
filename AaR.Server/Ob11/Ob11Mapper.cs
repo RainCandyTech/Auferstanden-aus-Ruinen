@@ -702,7 +702,9 @@ public static class Ob11Mapper
             candidate = url;
         if (candidate is null && !string.IsNullOrEmpty(file))
         {
-            if (file.StartsWith("file://")) candidate = file[7..];
+            if (file.StartsWith("file://"))
+                return file[7..];   // 本地文件 URI：直接用本地路径（2026-11-22 实拍：原实现误入
+                                     // 下载通道，new Uri(相对路径) 抛 "invalid request URI"）
             else if (file.StartsWith("base64://"))
             {
                 var b64 = file[9..];

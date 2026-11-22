@@ -116,19 +116,32 @@ public class AaRHub : Hub
     public void InternalLog(string level, string line)
         => _logger.Log(LogLevelFrom(level), "[bridge] {Line}", line);
 
-    /// <summary>1.0.0-preview2：hello 绑定账号的昵称自询（定向 targetUin 的 kernel RPC）。</summary>
+    /// <summary>1.0.0-preview2：hello 绑定账号的昵称自询（定向 targetUin 的 kernel RPC）。
+    /// 桥方法名是 self.info（L4 方法表口径，与主槽 RefreshSelfAsync 同名）。</summary>
     private async Task RefreshAccountNicknameAsync(string uin)
     {
         try
         {
-            var (ok, data, _) = await _registry.CallJsonAsync(_hubCtx, "user.self_info", null, targetUin: uin);
-            if (!ok || data is null) return;
+            var (ok, data, err) = await _registry.CallJsonAsync(_hubCtx, "self.info", null, targetUin: uin);
+            if (!ok || data is null)
+            {
+                _logger.LogWarning("account nickname probe failed for {Uin}: {Err}", uin, err ?? "-");
+                return;
+            }
             var nick = data.Value.TryGetProperty("nick", out var nv) &&
                        nv.ValueKind == JsonValueKind.String ? nv.GetString() : null;
-            if (!string.IsNullOrEmpty(nick))
-                await _store.SetAccountNicknameAsync(uin, nick);
+            if (string.IsNullOrEmpty(nick))
+            {
+                _logger.LogInformation("account nickname probe for {Uin}: self.info 无 nick 字段", uin);
+                return;
+            }
+            await _store.SetAccountNicknameAsync(uin, nick);
+            _logger.LogInformation("account nickname learned: {Uin} -> {Nick}", uin, nick);
         }
-        catch { /* best-effort：昵称缺失不影响账号档案 */ }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "account nickname probe error for {Uin}", uin);
+        }
     }
 
     private static LogLevel LogLevelFrom(string level) => level switch
